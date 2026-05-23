@@ -19,8 +19,37 @@
   let badgeInjectionInProgress = false; // Flag to prevent concurrent badge injections
   let previousBattle = null; // Stores pre-battle state for undo functionality
   let pluginConfigCache = null; // Cached plugin configuration from Stash settings
+
   // Gender filter: which genders are included in battles. Default excludes MALE to match original behavior.
-  let selectedGenders = ["FEMALE", "TRANSGENDER_MALE", "TRANSGENDER_FEMALE", "INTERSEX", "NON_BINARY"];
+  // Restore from localStorage if a previous selection was saved.
+  const GENDER_STORAGE_KEY = "hotOrNotV2_selectedGenders";
+  const _defaultGenders = [
+    "FEMALE",
+    "TRANSGENDER_MALE",
+    "TRANSGENDER_FEMALE",
+    "INTERSEX",
+    "NON_BINARY",
+  ];
+  let selectedGenders = (() => {
+    try {
+      const saved = localStorage.getItem(GENDER_STORAGE_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+    } catch (e) {
+      /* ignore */
+    }
+    return _defaultGenders.slice();
+  })();
+
+  function saveSelectedGenders() {
+    try {
+      localStorage.setItem(GENDER_STORAGE_KEY, JSON.stringify(selectedGenders));
+    } catch (e) {
+      /* ignore */
+    }
+  }
 
   // All genders supported by Stash, with display labels
   const ALL_GENDERS = [
@@ -49,7 +78,8 @@
           }
         }
       `);
-      pluginConfigCache = (result.configuration.plugins || {})["hotOrNotV2"] || {};
+      pluginConfigCache =
+        (result.configuration.plugins || {})["hotOrNotV2"] || {};
     } catch (e) {
       console.error("[HotOrNot] Failed to fetch plugin config:", e);
       pluginConfigCache = {};
@@ -79,11 +109,298 @@
     return config.showStarRatingWidget !== false;
   }
 
+  /**
+   * Returns true if compact card mode is enabled.
+   * Reads from Stash plugin settings; defaults to false.
+   * @returns {Promise<boolean>}
+   */
+  async function isCompactCard() {
+    const config = await getHotOrNotConfig();
+    return config.compactCard === true;
+  }
+
+  /**
+   * Returns true if the "Display Extra Images" option is enabled.
+   * Reads from Stash plugin settings; defaults to false.
+   * @returns {Promise<boolean>}
+   */
+  async function isDisplayExtraImages() {
+    const config = await getHotOrNotConfig();
+    return config.displayExtraImages === true;
+  }
+
+  /**
+   * Fetch up to `count` random scene-image thumbnails for a performer.
+   * Returns an array of thumbnail URL strings (may be shorter than count if fewer exist).
+   * @param {string} performerId
+   * @param {number} count
+   * @returns {Promise<string[]>}
+   */
+  // Per-performer gallery state.
+  // Map<performerId, { seed: string, lPage: number, pPage: number,
+  //                    landscape: string[], portrait: string[],
+  //                    lExhausted: boolean, pExhausted: boolean,
+  //                    seen: Set<string> }>
+  // Cleared whenever a new battle pair is loaded.
+  const galleryImagePools = new Map();
+  const GALLERY_PAGE_SIZE = 5;
+
+  /**
+   * Fetch one page of thumbnails for a given orientation bucket.
+   * Returns an array of thumbnail strings.
+   */
+  async function fetchGalleryPage(performerId, orientation, seed, page) {
+    const findQuery = `
+      query FindPerformerExtraImages($image_filter: ImageFilterType, $filter: FindFilterType) {
+        findImages(image_filter: $image_filter, filter: $filter) {
+          count
+          images { paths { thumbnail } }
+        }
+      }
+    `;
+    const result = await graphqlQuery(findQuery, {
+      image_filter: {
+        performers: { value: [performerId], modifier: "INCLUDES" },
+        orientation: {
+          value: [orientation === "Landscape" ? "LANDSCAPE" : "PORTRAIT"],
+        },
+      },
+      filter: { per_page: GALLERY_PAGE_SIZE, page, sort: `random_${seed}` },
+    });
+    return {
+      thumbnails: result.findImages.images
+        .map((img) => img.paths?.thumbnail)
+        .filter(Boolean),
+      total: result.findImages.count,
+    };
+  }
+
+  /**
+   * Ensure the performer has an initialised gallery pool entry.
+   * The first call fetches page 1 of both orientations in parallel.
+   */
+  async function ensureGalleryPool(performerId) {
+    if (galleryImagePools.has(performerId))
+      return galleryImagePools.get(performerId);
+
+    // Stable seed scoped to this battle session
+    const seed = Math.floor(Math.random() * 99999999);
+    const pool = {
+      seed,
+      lPage: 1,
+      pPage: 1,
+      landscape: [],
+      portrait: [],
+      lTotal: 0,
+      pTotal: 0,
+      lExhausted: false,
+      pExhausted: false,
+      seen: new Set(),
+    };
+    try {
+      const [ls, ps] = await Promise.all([
+        fetchGalleryPage(performerId, "Landscape", seed, 1),
+        fetchGalleryPage(performerId, "Portrait", seed, 1),
+      ]);
+      pool.landscape = ls.thumbnails;
+      pool.portrait = ps.thumbnails;
+      pool.lTotal = ls.total;
+      pool.pTotal = ps.total;
+      if (ls.thumbnails.length < GALLERY_PAGE_SIZE) pool.lExhausted = true;
+      if (ps.thumbnails.length < GALLERY_PAGE_SIZE) pool.pExhausted = true;
+    } catch (e) {
+      console.warn(
+        "[HotOrNot] Failed to fetch gallery pool for performer",
+        performerId,
+        e,
+      );
+    }
+    galleryImagePools.set(performerId, pool);
+    return pool;
+  }
+
+  /**
+   * Get fresh thumbnails for one orientation bucket, fetching the next page if needed.
+   * Returns an array of unseen thumbnails from the bucket (may be of any length ≥ 0).
+   */
+  async function getFreeBucket(pool, performerId, orientation) {
+    const isLandscape = orientation === "Landscape";
+    const bucketKey = isLandscape ? "landscape" : "portrait";
+    const pageKey = isLandscape ? "lPage" : "pPage";
+    const exhaustKey = isLandscape ? "lExhausted" : "pExhausted";
+
+    let fresh = pool[bucketKey].filter((t) => !pool.seen.has(t));
+    // If no fresh items and more pages exist, fetch the next page
+    if (fresh.length === 0 && !pool[exhaustKey]) {
+      pool[pageKey]++;
+      try {
+        const more = await fetchGalleryPage(
+          performerId,
+          orientation,
+          pool.seed,
+          pool[pageKey],
+        );
+        pool[bucketKey].push(...more);
+        if (more.length < GALLERY_PAGE_SIZE) pool[exhaustKey] = true;
+      } catch (e) {
+        console.warn("[HotOrNot] Failed to fetch next gallery page", e);
+        pool[exhaustKey] = true;
+      }
+      fresh = pool[bucketKey].filter((t) => !pool.seen.has(t));
+    }
+    return fresh;
+  }
+
+  /**
+   * Pick a fresh set of extra images for a performer.
+   * - Randomly chooses between 1-landscape or 2-portrait when both are viable.
+   * - Paginates with a stable seed so images never repeat until the full set is exhausted,
+   *   at which point the seen set resets so cycling restarts from the beginning.
+   * Returns { thumbnails: string[], single: boolean }.
+   */
+  async function fetchPerformerExtraImages(performerId) {
+    const pool = await ensureGalleryPool(performerId);
+
+    let freshL = await getFreeBucket(pool, performerId, "Landscape");
+    let freshP = await getFreeBucket(pool, performerId, "Portrait");
+
+    const canL = freshL.length >= 1;
+    const canP = freshP.length >= 2;
+
+    // If completely exhausted, reset seen and re-evaluate
+    if (!canL && !canP) {
+      pool.seen.clear();
+      freshL = await getFreeBucket(pool, performerId, "Landscape");
+      freshP = await getFreeBucket(pool, performerId, "Portrait");
+    }
+
+    // Decide layout
+    const canL2 = freshL.length >= 1;
+    const canP2 = freshP.length >= 2;
+    const canP1 = freshP.length >= 1; // single portrait fallback
+    let useLandscape;
+    if (canL2 && canP2) useLandscape = Math.random() < 0.5;
+    else if (canL2) useLandscape = true;
+    else if (canP2) useLandscape = false;
+    else if (canP1)
+      useLandscape = false; // single portrait, shown in fit/single mode
+    else return { thumbnails: [], single: true };
+
+    let selected;
+    if (useLandscape) {
+      selected = [freshL[Math.floor(Math.random() * freshL.length)]];
+    } else if (freshP.length >= 2) {
+      const idx1 = Math.floor(Math.random() * freshP.length);
+      let idx2 = Math.floor(Math.random() * (freshP.length - 1));
+      if (idx2 >= idx1) idx2++;
+      selected = [freshP[idx1], freshP[idx2]];
+    } else {
+      // Only 1 portrait available
+      selected = [freshP[0]];
+    }
+
+    selected.forEach((t) => pool.seen.add(t));
+    // Show refresh button only if more images exist beyond what's selected
+    const totalImages = (pool.lTotal || 0) + (pool.pTotal || 0);
+    const hasMore = totalImages > selected.length;
+    // Use single/fit mode for landscape OR when only 1 image was selected
+    return {
+      thumbnails: selected,
+      single: useLandscape || selected.length === 1,
+      hasMore,
+    };
+  }
+
+  /**
+   * Build the .hon-image-gallery-extras HTML.
+   * @param {{ thumbnails: string[], single: boolean }} extraData
+   * @param {string} performerId
+   * @returns {string}
+   */
+  function buildGalleryExtrasHtml(extraData, performerId) {
+    const { thumbnails, single, hasMore } = extraData;
+    const singleClass = single ? " hon-gallery-single" : "";
+    const imgs = thumbnails
+      .map(
+        (src) =>
+          `<img class="hon-gallery-extra-img" src="${src}" loading="lazy" alt="" />`,
+      )
+      .join("\n      ");
+    const refreshBtn = hasMore
+      ? `<button class="hon-gallery-refresh-btn" title="Refresh images">&#x21BA;</button>`
+      : "";
+    return `
+      <div class="hon-image-gallery-extras${singleClass}" data-performer-id="${performerId}">
+        ${imgs}
+        ${refreshBtn}
+      </div>`;
+  }
+
+  /**
+   * Wire up the refresh button(s) inside a rendered gallery section.
+   * @param {Element} root - Element to search within (e.g. comparisonArea)
+   */
+  function attachGalleryRefreshHandlers(root) {
+    root.querySelectorAll(".hon-gallery-refresh-btn").forEach((btn) => {
+      btn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const extrasEl = btn.closest(".hon-image-gallery-extras");
+        if (!extrasEl) return;
+        const performerId = extrasEl.dataset.performerId;
+        if (!performerId) return;
+
+        btn.disabled = true;
+        btn.textContent = "\u231B";
+
+        const extraData = await fetchPerformerExtraImages(performerId);
+        const { thumbnails, single, hasMore } = extraData;
+
+        extrasEl.classList.toggle("hon-gallery-single", single);
+
+        extrasEl
+          .querySelectorAll(".hon-gallery-extra-img")
+          .forEach((el) => el.remove());
+        // Update refresh button visibility
+        const existingBtn = extrasEl.querySelector(".hon-gallery-refresh-btn");
+        if (hasMore && !existingBtn) {
+          const newBtn = document.createElement("button");
+          newBtn.className = "hon-gallery-refresh-btn";
+          newBtn.title = "Refresh images";
+          newBtn.innerHTML = "&#x21BA;";
+          extrasEl.appendChild(newBtn);
+          attachGalleryRefreshHandlers(extrasEl);
+        } else if (!hasMore && existingBtn) {
+          existingBtn.remove();
+        }
+        thumbnails.forEach((src) => {
+          const el = document.createElement("img");
+          el.className = "hon-gallery-extra-img";
+          el.src = src;
+          el.loading = "lazy";
+          el.alt = "";
+          // Insert before the refresh button if still present, otherwise append
+          const currentBtn = extrasEl.querySelector(".hon-gallery-refresh-btn");
+          extrasEl.insertBefore(el, currentBtn || null);
+        });
+
+        // Re-enable the button only if it's still in the DOM
+        if (btn.isConnected) {
+          btn.disabled = false;
+          btn.textContent = "\u21BA";
+        }
+      });
+    });
+  }
+
   // GraphQL filter modifier constants
   // Array-based modifiers require value_list field for enum-based criterion inputs
   // (e.g., GenderCriterionInput uses value_list for INCLUDES/EXCLUDES).
   // HierarchicalMultiCriterionInput types (tags, studios) always use 'value' field regardless of modifier.
-  const ARRAY_BASED_MODIFIERS = new Set(['INCLUDES', 'EXCLUDES', 'INCLUDES_ALL']);
+  const ARRAY_BASED_MODIFIERS = new Set([
+    "INCLUDES",
+    "EXCLUDES",
+    "INCLUDES_ALL",
+  ]);
 
   // ============================================
   // COUNTRY DISPLAY HELPER
@@ -92,78 +409,256 @@
   // ISO 3166-1 alpha-2 country code to full country name lookup table.
   // Names match the i18n-iso-countries English locale used by Stash (first alias when multiple exist).
   const COUNTRY_NAMES = {
-    "AF": "Afghanistan", "AX": "Åland Islands", "AL": "Albania", "DZ": "Algeria",
-    "AS": "American Samoa", "AD": "Andorra", "AO": "Angola", "AI": "Anguilla",
-    "AQ": "Antarctica", "AG": "Antigua and Barbuda", "AR": "Argentina", "AM": "Armenia",
-    "AW": "Aruba", "AU": "Australia", "AT": "Austria", "AZ": "Azerbaijan",
-    "BS": "Bahamas", "BH": "Bahrain", "BD": "Bangladesh", "BB": "Barbados",
-    "BY": "Belarus", "BE": "Belgium", "BZ": "Belize", "BJ": "Benin", "BM": "Bermuda",
-    "BT": "Bhutan", "BO": "Bolivia", "BQ": "Bonaire, Sint Eustatius and Saba",
-    "BA": "Bosnia and Herzegovina", "BW": "Botswana", "BV": "Bouvet Island",
-    "BR": "Brazil", "IO": "British Indian Ocean Territory", "BN": "Brunei Darussalam",
-    "BG": "Bulgaria", "BF": "Burkina Faso", "BI": "Burundi", "KH": "Cambodia",
-    "CM": "Cameroon", "CA": "Canada", "CV": "Cape Verde", "KY": "Cayman Islands",
-    "CF": "Central African Republic", "TD": "Chad", "CL": "Chile",
-    "CN": "People's Republic of China", "CX": "Christmas Island",
-    "CC": "Cocos (Keeling) Islands", "CO": "Colombia", "KM": "Comoros",
-    "CG": "Republic of the Congo", "CD": "Democratic Republic of the Congo",
-    "CK": "Cook Islands", "CR": "Costa Rica", "CI": "Cote d'Ivoire", "HR": "Croatia",
-    "CU": "Cuba", "CW": "Curaçao", "CY": "Cyprus", "CZ": "Czech Republic",
-    "DK": "Denmark", "DJ": "Djibouti", "DM": "Dominica", "DO": "Dominican Republic",
-    "EC": "Ecuador", "EG": "Egypt", "SV": "El Salvador", "GQ": "Equatorial Guinea",
-    "ER": "Eritrea", "EE": "Estonia", "ET": "Ethiopia", "SZ": "Eswatini",
-    "FK": "Falkland Islands (Malvinas)", "FO": "Faroe Islands", "FJ": "Fiji",
-    "FI": "Finland", "FR": "France", "GF": "French Guiana", "PF": "French Polynesia",
-    "TF": "French Southern Territories", "GA": "Gabon", "GM": "Republic of The Gambia",
-    "GE": "Georgia", "DE": "Germany", "GH": "Ghana", "GI": "Gibraltar", "GR": "Greece",
-    "GL": "Greenland", "GD": "Grenada", "GP": "Guadeloupe", "GU": "Guam",
-    "GT": "Guatemala", "GG": "Guernsey", "GN": "Guinea", "GW": "Guinea-Bissau",
-    "GY": "Guyana", "HT": "Haiti", "HM": "Heard Island and McDonald Islands",
-    "VA": "Holy See (Vatican City State)", "HN": "Honduras", "HK": "Hong Kong",
-    "HU": "Hungary", "IS": "Iceland", "IN": "India", "ID": "Indonesia",
-    "IR": "Islamic Republic of Iran", "IQ": "Iraq", "IE": "Ireland", "IM": "Isle of Man",
-    "IL": "Israel", "IT": "Italy", "JM": "Jamaica", "JP": "Japan", "JE": "Jersey",
-    "JO": "Jordan", "KZ": "Kazakhstan", "KE": "Kenya", "KI": "Kiribati",
-    "KP": "North Korea", "KR": "South Korea", "XK": "Kosovo", "KW": "Kuwait",
-    "KG": "Kyrgyzstan", "LA": "Lao People's Democratic Republic", "LV": "Latvia",
-    "LB": "Lebanon", "LS": "Lesotho", "LR": "Liberia", "LY": "Libya",
-    "LI": "Liechtenstein", "LT": "Lithuania", "LU": "Luxembourg", "MO": "Macao",
-    "MG": "Madagascar", "MW": "Malawi", "MY": "Malaysia", "MV": "Maldives", "ML": "Mali",
-    "MT": "Malta", "MH": "Marshall Islands", "MQ": "Martinique", "MR": "Mauritania",
-    "MU": "Mauritius", "YT": "Mayotte", "MX": "Mexico",
-    "FM": "Micronesia, Federated States of", "MD": "Moldova, Republic of", "MC": "Monaco",
-    "MN": "Mongolia", "ME": "Montenegro", "MS": "Montserrat", "MA": "Morocco",
-    "MZ": "Mozambique", "MM": "Myanmar", "NA": "Namibia", "NR": "Nauru", "NP": "Nepal",
-    "NL": "Netherlands", "NC": "New Caledonia", "NZ": "New Zealand", "NI": "Nicaragua",
-    "NE": "Niger", "NG": "Nigeria", "NU": "Niue", "NF": "Norfolk Island",
-    "MK": "North Macedonia", "MP": "Northern Mariana Islands", "NO": "Norway",
-    "OM": "Oman", "PK": "Pakistan", "PW": "Palau", "PS": "State of Palestine",
-    "PA": "Panama", "PG": "Papua New Guinea", "PY": "Paraguay", "PE": "Peru",
-    "PH": "Philippines", "PN": "Pitcairn", "PL": "Poland", "PT": "Portugal",
-    "PR": "Puerto Rico", "QA": "Qatar", "RE": "Reunion", "RO": "Romania",
-    "RU": "Russian Federation", "RW": "Rwanda", "BL": "Saint Barthélemy",
-    "SH": "Saint Helena", "KN": "Saint Kitts and Nevis", "LC": "Saint Lucia",
-    "MF": "Saint Martin (French part)", "PM": "Saint Pierre and Miquelon",
-    "VC": "Saint Vincent and the Grenadines", "WS": "Samoa", "SM": "San Marino",
-    "ST": "Sao Tome and Principe", "SA": "Saudi Arabia", "SN": "Senegal", "RS": "Serbia",
-    "SC": "Seychelles", "SL": "Sierra Leone", "SG": "Singapore",
-    "SX": "Sint Maarten (Dutch part)", "SK": "Slovakia", "SI": "Slovenia",
-    "SB": "Solomon Islands", "SO": "Somalia", "ZA": "South Africa",
-    "GS": "South Georgia and the South Sandwich Islands", "SS": "South Sudan",
-    "ES": "Spain", "LK": "Sri Lanka", "SD": "Sudan", "SR": "Suriname",
-    "SJ": "Svalbard and Jan Mayen", "SE": "Sweden", "CH": "Switzerland",
-    "SY": "Syrian Arab Republic", "TW": "Taiwan, Province of China",
-    "TJ": "Tajikistan", "TZ": "United Republic of Tanzania", "TH": "Thailand",
-    "TL": "Timor-Leste", "TG": "Togo", "TK": "Tokelau", "TO": "Tonga",
-    "TT": "Trinidad and Tobago", "TN": "Tunisia", "TR": "Türkiye",
-    "TM": "Turkmenistan", "TC": "Turks and Caicos Islands", "TV": "Tuvalu",
-    "UG": "Uganda", "UA": "Ukraine", "AE": "United Arab Emirates",
-    "GB": "United Kingdom", "US": "United States of America",
-    "UM": "United States Minor Outlying Islands", "UY": "Uruguay", "UZ": "Uzbekistan",
-    "VU": "Vanuatu", "VE": "Venezuela", "VN": "Vietnam",
-    "VG": "Virgin Islands, British", "VI": "Virgin Islands, U.S.",
-    "WF": "Wallis and Futuna", "EH": "Western Sahara", "YE": "Yemen",
-    "ZM": "Zambia", "ZW": "Zimbabwe"
+    AF: "Afghanistan",
+    AX: "Åland Islands",
+    AL: "Albania",
+    DZ: "Algeria",
+    AS: "American Samoa",
+    AD: "Andorra",
+    AO: "Angola",
+    AI: "Anguilla",
+    AQ: "Antarctica",
+    AG: "Antigua and Barbuda",
+    AR: "Argentina",
+    AM: "Armenia",
+    AW: "Aruba",
+    AU: "Australia",
+    AT: "Austria",
+    AZ: "Azerbaijan",
+    BS: "Bahamas",
+    BH: "Bahrain",
+    BD: "Bangladesh",
+    BB: "Barbados",
+    BY: "Belarus",
+    BE: "Belgium",
+    BZ: "Belize",
+    BJ: "Benin",
+    BM: "Bermuda",
+    BT: "Bhutan",
+    BO: "Bolivia",
+    BQ: "Bonaire, Sint Eustatius and Saba",
+    BA: "Bosnia and Herzegovina",
+    BW: "Botswana",
+    BV: "Bouvet Island",
+    BR: "Brazil",
+    IO: "British Indian Ocean Territory",
+    BN: "Brunei Darussalam",
+    BG: "Bulgaria",
+    BF: "Burkina Faso",
+    BI: "Burundi",
+    KH: "Cambodia",
+    CM: "Cameroon",
+    CA: "Canada",
+    CV: "Cape Verde",
+    KY: "Cayman Islands",
+    CF: "Central African Republic",
+    TD: "Chad",
+    CL: "Chile",
+    CN: "People's Republic of China",
+    CX: "Christmas Island",
+    CC: "Cocos (Keeling) Islands",
+    CO: "Colombia",
+    KM: "Comoros",
+    CG: "Republic of the Congo",
+    CD: "Democratic Republic of the Congo",
+    CK: "Cook Islands",
+    CR: "Costa Rica",
+    CI: "Cote d'Ivoire",
+    HR: "Croatia",
+    CU: "Cuba",
+    CW: "Curaçao",
+    CY: "Cyprus",
+    CZ: "Czech Republic",
+    DK: "Denmark",
+    DJ: "Djibouti",
+    DM: "Dominica",
+    DO: "Dominican Republic",
+    EC: "Ecuador",
+    EG: "Egypt",
+    SV: "El Salvador",
+    GQ: "Equatorial Guinea",
+    ER: "Eritrea",
+    EE: "Estonia",
+    ET: "Ethiopia",
+    SZ: "Eswatini",
+    FK: "Falkland Islands (Malvinas)",
+    FO: "Faroe Islands",
+    FJ: "Fiji",
+    FI: "Finland",
+    FR: "France",
+    GF: "French Guiana",
+    PF: "French Polynesia",
+    TF: "French Southern Territories",
+    GA: "Gabon",
+    GM: "Republic of The Gambia",
+    GE: "Georgia",
+    DE: "Germany",
+    GH: "Ghana",
+    GI: "Gibraltar",
+    GR: "Greece",
+    GL: "Greenland",
+    GD: "Grenada",
+    GP: "Guadeloupe",
+    GU: "Guam",
+    GT: "Guatemala",
+    GG: "Guernsey",
+    GN: "Guinea",
+    GW: "Guinea-Bissau",
+    GY: "Guyana",
+    HT: "Haiti",
+    HM: "Heard Island and McDonald Islands",
+    VA: "Holy See (Vatican City State)",
+    HN: "Honduras",
+    HK: "Hong Kong",
+    HU: "Hungary",
+    IS: "Iceland",
+    IN: "India",
+    ID: "Indonesia",
+    IR: "Islamic Republic of Iran",
+    IQ: "Iraq",
+    IE: "Ireland",
+    IM: "Isle of Man",
+    IL: "Israel",
+    IT: "Italy",
+    JM: "Jamaica",
+    JP: "Japan",
+    JE: "Jersey",
+    JO: "Jordan",
+    KZ: "Kazakhstan",
+    KE: "Kenya",
+    KI: "Kiribati",
+    KP: "North Korea",
+    KR: "South Korea",
+    XK: "Kosovo",
+    KW: "Kuwait",
+    KG: "Kyrgyzstan",
+    LA: "Lao People's Democratic Republic",
+    LV: "Latvia",
+    LB: "Lebanon",
+    LS: "Lesotho",
+    LR: "Liberia",
+    LY: "Libya",
+    LI: "Liechtenstein",
+    LT: "Lithuania",
+    LU: "Luxembourg",
+    MO: "Macao",
+    MG: "Madagascar",
+    MW: "Malawi",
+    MY: "Malaysia",
+    MV: "Maldives",
+    ML: "Mali",
+    MT: "Malta",
+    MH: "Marshall Islands",
+    MQ: "Martinique",
+    MR: "Mauritania",
+    MU: "Mauritius",
+    YT: "Mayotte",
+    MX: "Mexico",
+    FM: "Micronesia, Federated States of",
+    MD: "Moldova, Republic of",
+    MC: "Monaco",
+    MN: "Mongolia",
+    ME: "Montenegro",
+    MS: "Montserrat",
+    MA: "Morocco",
+    MZ: "Mozambique",
+    MM: "Myanmar",
+    NA: "Namibia",
+    NR: "Nauru",
+    NP: "Nepal",
+    NL: "Netherlands",
+    NC: "New Caledonia",
+    NZ: "New Zealand",
+    NI: "Nicaragua",
+    NE: "Niger",
+    NG: "Nigeria",
+    NU: "Niue",
+    NF: "Norfolk Island",
+    MK: "North Macedonia",
+    MP: "Northern Mariana Islands",
+    NO: "Norway",
+    OM: "Oman",
+    PK: "Pakistan",
+    PW: "Palau",
+    PS: "State of Palestine",
+    PA: "Panama",
+    PG: "Papua New Guinea",
+    PY: "Paraguay",
+    PE: "Peru",
+    PH: "Philippines",
+    PN: "Pitcairn",
+    PL: "Poland",
+    PT: "Portugal",
+    PR: "Puerto Rico",
+    QA: "Qatar",
+    RE: "Reunion",
+    RO: "Romania",
+    RU: "Russian Federation",
+    RW: "Rwanda",
+    BL: "Saint Barthélemy",
+    SH: "Saint Helena",
+    KN: "Saint Kitts and Nevis",
+    LC: "Saint Lucia",
+    MF: "Saint Martin (French part)",
+    PM: "Saint Pierre and Miquelon",
+    VC: "Saint Vincent and the Grenadines",
+    WS: "Samoa",
+    SM: "San Marino",
+    ST: "Sao Tome and Principe",
+    SA: "Saudi Arabia",
+    SN: "Senegal",
+    RS: "Serbia",
+    SC: "Seychelles",
+    SL: "Sierra Leone",
+    SG: "Singapore",
+    SX: "Sint Maarten (Dutch part)",
+    SK: "Slovakia",
+    SI: "Slovenia",
+    SB: "Solomon Islands",
+    SO: "Somalia",
+    ZA: "South Africa",
+    GS: "South Georgia and the South Sandwich Islands",
+    SS: "South Sudan",
+    ES: "Spain",
+    LK: "Sri Lanka",
+    SD: "Sudan",
+    SR: "Suriname",
+    SJ: "Svalbard and Jan Mayen",
+    SE: "Sweden",
+    CH: "Switzerland",
+    SY: "Syrian Arab Republic",
+    TW: "Taiwan, Province of China",
+    TJ: "Tajikistan",
+    TZ: "United Republic of Tanzania",
+    TH: "Thailand",
+    TL: "Timor-Leste",
+    TG: "Togo",
+    TK: "Tokelau",
+    TO: "Tonga",
+    TT: "Trinidad and Tobago",
+    TN: "Tunisia",
+    TR: "Türkiye",
+    TM: "Turkmenistan",
+    TC: "Turks and Caicos Islands",
+    TV: "Tuvalu",
+    UG: "Uganda",
+    UA: "Ukraine",
+    AE: "United Arab Emirates",
+    GB: "United Kingdom",
+    US: "United States of America",
+    UM: "United States Minor Outlying Islands",
+    UY: "Uruguay",
+    UZ: "Uzbekistan",
+    VU: "Vanuatu",
+    VE: "Venezuela",
+    VN: "Vietnam",
+    VG: "Virgin Islands, British",
+    VI: "Virgin Islands, U.S.",
+    WF: "Wallis and Futuna",
+    EH: "Western Sahara",
+    YE: "Yemen",
+    ZM: "Zambia",
+    ZW: "Zimbabwe",
   };
 
   /**
@@ -177,14 +672,27 @@
   function getCountryDisplay(countryCode) {
     if (!countryCode) return "";
     const code = countryCode.toUpperCase().trim();
-    const name = COUNTRY_NAMES[code] || code.replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"})[c]);
+    const name =
+      COUNTRY_NAMES[code] ||
+      code.replace(
+        /[&<>"']/g,
+        (c) =>
+          ({
+            "&": "&amp;",
+            "<": "&lt;",
+            ">": "&gt;",
+            '"': "&quot;",
+            "'": "&#39;",
+          })[c],
+      );
     const flagClass = `fi fi-${code.toLowerCase().replace(/[^a-z]/g, "")}`;
     return `<span class="${flagClass}"></span> ${name}`;
   }
 
   function getGenderDisplay(gender) {
     if (!gender) return "";
-    return (ALL_GENDERS.find(g => g.value === gender) || { label: gender }).label;
+    return (ALL_GENDERS.find((g) => g.value === gender) || { label: gender })
+      .label;
   }
 
   // ============================================
@@ -207,16 +715,24 @@
         const client = PluginApi.utils.StashService.getClient();
         const doc = gql(query);
         const isMutation = doc.definitions.some(
-          (def) => def.kind === "OperationDefinition" && def.operation === "mutation"
+          (def) =>
+            def.kind === "OperationDefinition" && def.operation === "mutation",
         );
         const result = isMutation
           ? await client.mutate({ mutation: doc, variables })
-          : await client.query({ query: doc, variables, fetchPolicy: "no-cache" });
+          : await client.query({
+              query: doc,
+              variables,
+              fetchPolicy: "no-cache",
+            });
         return result.data;
       } catch (apolloError) {
         // Fall back to direct fetch when Apollo client is unavailable or in an invalid
         // state (e.g., clearStore called during an in-progress query/mutation)
-        console.warn("[HotOrNot] Apollo client error, falling back to fetch:", apolloError?.message || apolloError);
+        console.warn(
+          "[HotOrNot] Apollo client error, falling back to fetch:",
+          apolloError?.message || apolloError,
+        );
       }
     }
     // Fallback: direct fetch (for environments where PluginApi is not available)
@@ -271,37 +787,42 @@
     try {
       const urlParams = new URLSearchParams(window.location.search);
       // Use getAll() to support multiple filter criteria (multiple c= parameters)
-      const criteriaParams = urlParams.getAll('c');
-      
+      const criteriaParams = urlParams.getAll("c");
+
       if (!criteriaParams || criteriaParams.length === 0) {
-        console.log('[HotOrNot] No filter criteria found in URL (no "c" parameter)');
+        console.log(
+          '[HotOrNot] No filter criteria found in URL (no "c" parameter)',
+        );
         return [];
       }
-      
-      console.log(`[HotOrNot] Found ${criteriaParams.length} filter parameter(s) in URL:`, criteriaParams);
-      
+
+      console.log(
+        `[HotOrNot] Found ${criteriaParams.length} filter parameter(s) in URL:`,
+        criteriaParams,
+      );
+
       const allParsedCriteria = [];
-      
+
       // Parse each criterion parameter separately
       for (const criteriaParam of criteriaParams) {
         // The 'c' parameter contains encoded JSON criteria
         // Try to decode and parse it
         const decoded = decodeURIComponent(criteriaParam);
-        console.log('[HotOrNot] Decoded filter criteria:', decoded);
-        
+        console.log("[HotOrNot] Decoded filter criteria:", decoded);
+
         // Stash uses a custom encoding format for criteria
         // It can be a JSON array or individual criteria strings
         // Try parsing as JSON first
         try {
           const criteria = JSON.parse(decoded);
           const result = Array.isArray(criteria) ? criteria : [criteria];
-          console.log('[HotOrNot] Parsed criteria as JSON:', result);
+          console.log("[HotOrNot] Parsed criteria as JSON:", result);
           allParsedCriteria.push(...result);
         } catch (e) {
           // If not valid JSON, it might be the newer Stash encoding
           // Stash may encode criteria with parentheses instead of curly braces
           // Format: ("type":"tags","value":("items":[...],"depth":0),"modifier":"INCLUDES")
-          
+
           // FIRST: Normalize ALL parentheses to curly braces before any splitting
           // This must happen before splitting because the split pattern ),(
           // also appears inside array elements like: [("id":"1"),("id":"2")]
@@ -311,22 +832,28 @@
           // "label":"Action (2023)"), it would have parsed successfully in the first attempt.
           // Stash only uses parentheses to replace structural braces, not within string values.
           let normalized = decoded.trim();
-          normalized = normalized.replace(/\(/g, '{');
-          normalized = normalized.replace(/\)/g, '}');
-          
+          normalized = normalized.replace(/\(/g, "{");
+          normalized = normalized.replace(/\)/g, "}");
+
           // Try parsing the normalized string as JSON
           try {
             const criteria = JSON.parse(normalized);
             const result = Array.isArray(criteria) ? criteria : [criteria];
-            console.log('[HotOrNot] Parsed normalized criteria as JSON:', result);
+            console.log(
+              "[HotOrNot] Parsed normalized criteria as JSON:",
+              result,
+            );
             allParsedCriteria.push(...result);
           } catch (parseErr) {
             // If still not valid JSON, try splitting on },{ pattern
             // (only after normalization to avoid splitting inside arrays)
-            const delimiter = '|||SPLIT|||';
-            const withDelimiter = normalized.replace(/\}\s*,?\s*\{/g, '}' + delimiter + '{');
+            const delimiter = "|||SPLIT|||";
+            const withDelimiter = normalized.replace(
+              /\}\s*,?\s*\{/g,
+              "}" + delimiter + "{",
+            );
             const criteriaStrings = withDelimiter.split(delimiter);
-            
+
             for (const criteriaStr of criteriaStrings) {
               try {
                 const criterion = JSON.parse(criteriaStr.trim());
@@ -334,17 +861,21 @@
                   allParsedCriteria.push(criterion);
                 }
               } catch (splitParseErr) {
-                console.warn('[HotOrNot] Could not parse criterion:', criteriaStr, splitParseErr);
+                console.warn(
+                  "[HotOrNot] Could not parse criterion:",
+                  criteriaStr,
+                  splitParseErr,
+                );
               }
             }
           }
         }
       }
-      
-      console.log('[HotOrNot] Total parsed criteria:', allParsedCriteria);
+
+      console.log("[HotOrNot] Total parsed criteria:", allParsedCriteria);
       return allParsedCriteria;
     } catch (e) {
-      console.warn('[HotOrNot] Error parsing URL filter criteria:', e);
+      console.warn("[HotOrNot] Error parsing URL filter criteria:", e);
       return [];
     }
   }
@@ -365,7 +896,11 @@
     // Note: We use !== undefined rather than hasOwnProperty because:
     // - If value.value is null, we want to return null (filter should not apply)
     // - If value.value is undefined, the property doesn't exist, so return original
-    if (typeof value === 'object' && !Array.isArray(value) && value.value !== undefined) {
+    if (
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      value.value !== undefined
+    ) {
       return value.value;
     }
     // If it's an array, return it as-is (for multi-value filters)
@@ -405,30 +940,32 @@
    * @returns {string} Normalized gender value in GraphQL enum format
    */
   function normalizeGenderValue(value) {
-    if (!value || typeof value !== 'string') {
+    if (!value || typeof value !== "string") {
       return value;
     }
-    
+
     // Convert to uppercase and replace spaces and hyphens with underscores
-    const normalized = value.toUpperCase().replace(/[\s-]+/g, '_');
-    
+    const normalized = value.toUpperCase().replace(/[\s-]+/g, "_");
+
     // Validate against known GenderEnum values
     const validGenders = new Set([
-      'MALE',
-      'FEMALE',
-      'TRANSGENDER_MALE',
-      'TRANSGENDER_FEMALE',
-      'INTERSEX',
-      'NON_BINARY'
+      "MALE",
+      "FEMALE",
+      "TRANSGENDER_MALE",
+      "TRANSGENDER_FEMALE",
+      "INTERSEX",
+      "NON_BINARY",
     ]);
-    
+
     if (validGenders.has(normalized)) {
       return normalized;
     }
-    
+
     // If not valid, log a warning and return the original value
     // This allows the GraphQL API to reject it with a clear error message
-    console.warn(`[HotOrNot] Invalid gender value "${value}" - valid values are: ${Array.from(validGenders).join(', ')}`);
+    console.warn(
+      `[HotOrNot] Invalid gender value "${value}" - valid values are: ${Array.from(validGenders).join(", ")}`,
+    );
     return value;
   }
 
@@ -442,11 +979,15 @@
   function createNumericFilterObject(value, modifier, defaultModifier) {
     const filterObj = {
       value: safeParseInt(value, 0),
-      modifier: modifier || defaultModifier
+      modifier: modifier || defaultModifier,
     };
     // Handle BETWEEN modifier which requires value2
     // value can be an object like { "value": 20, "value2": 30 }
-    if (typeof value === 'object' && !Array.isArray(value) && value.value2 !== undefined) {
+    if (
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      value.value2 !== undefined
+    ) {
       filterObj.value2 = safeParseInt(value.value2, 0);
     }
     return filterObj;
@@ -463,18 +1004,18 @@
     }
 
     const { type, value, modifier } = criterion;
-    
+
     // Map URL criterion types to GraphQL filter fields
     // The filter structure varies based on the criterion type
     switch (type) {
-      case 'tags':
+      case "tags":
         // Tags filter: value contains items (tag IDs or tag objects) and depth
         // Stash URL criteria may send items as objects like {id: "1", label: "JAV"}
         // or just strings/numbers representing IDs
         if (value && value.items && value.items.length > 0) {
           // Extract IDs from items - handle both object format and direct ID format
-          const tagIds = value.items.map(item => {
-            if (typeof item === 'object' && item !== null && 'id' in item) {
+          const tagIds = value.items.map((item) => {
+            if (typeof item === "object" && item !== null && "id" in item) {
               return item.id;
             }
             return item;
@@ -482,21 +1023,21 @@
           return {
             tags: {
               value: tagIds,
-              modifier: modifier || 'INCLUDES',
-              depth: value.depth || 0
-            }
+              modifier: modifier || "INCLUDES",
+              depth: value.depth || 0,
+            },
           };
         }
         break;
-        
-      case 'studios':
+
+      case "studios":
         // Studios filter
         // Stash URL criteria may send items as objects like {id: "1", label: "Studio Name"}
         // or just strings/numbers representing IDs
         if (value && value.items && value.items.length > 0) {
           // Extract IDs from items - handle both object format and direct ID format
-          const studioIds = value.items.map(item => {
-            if (typeof item === 'object' && item !== null && 'id' in item) {
+          const studioIds = value.items.map((item) => {
+            if (typeof item === "object" && item !== null && "id" in item) {
               return item.id;
             }
             return item;
@@ -504,35 +1045,39 @@
           return {
             studios: {
               value: studioIds,
-              modifier: modifier || 'INCLUDES',
-              depth: value.depth || 0
-            }
+              modifier: modifier || "INCLUDES",
+              depth: value.depth || 0,
+            },
           };
         }
         break;
-        
-      case 'gender':
+
+      case "gender":
         // Gender filter
         // Extract simple value from potential nested object (e.g., { "value": "FEMALE" } -> "FEMALE")
         // Also handles array format (e.g., ["Female"] -> "Female" for EQUALS modifier)
         if (value) {
           let genderValue = extractSimpleValue(value);
           if (genderValue) {
-            const effectiveModifier = modifier || 'EQUALS';
+            const effectiveModifier = modifier || "EQUALS";
             // Use value_list for array-based modifiers (INCLUDES, EXCLUDES, etc.)
             // Use value for single-value modifiers (EQUALS, NOT_EQUALS)
             const useValueList = ARRAY_BASED_MODIFIERS.has(effectiveModifier);
-            
+
             if (useValueList) {
               // Convert genderValue to array format for value_list field
-              const genderArray = Array.isArray(genderValue) ? genderValue : [genderValue];
+              const genderArray = Array.isArray(genderValue)
+                ? genderValue
+                : [genderValue];
               // Normalize each gender value to valid GraphQL enum format
-              const normalizedArray = genderArray.map(g => normalizeGenderValue(g));
+              const normalizedArray = genderArray.map((g) =>
+                normalizeGenderValue(g),
+              );
               return {
                 gender: {
                   value_list: normalizedArray,
-                  modifier: effectiveModifier
-                }
+                  modifier: effectiveModifier,
+                },
               };
             } else {
               // For single-value modifiers, extract first element if genderValue is an array
@@ -545,46 +1090,50 @@
                 return {
                   gender: {
                     value: normalizedValue,
-                    modifier: effectiveModifier
-                  }
+                    modifier: effectiveModifier,
+                  },
                 };
               }
             }
           }
         }
         break;
-        
-      case 'favorite':
-      case 'filter_favorites':
+
+      case "favorite":
+      case "filter_favorites":
         // Favorite filter
         if (value !== undefined && value !== null) {
           const favValue = extractSimpleValue(value);
           return {
-            filter_favorites: favValue === true || favValue === 'true'
+            filter_favorites: favValue === true || favValue === "true",
           };
         }
         break;
-        
-      case 'rating':
-      case 'rating100':
+
+      case "rating":
+      case "rating100":
         // Rating filter
         if (value !== undefined && value !== null) {
           return {
-            rating100: createNumericFilterObject(value, modifier, 'GREATER_THAN')
+            rating100: createNumericFilterObject(
+              value,
+              modifier,
+              "GREATER_THAN",
+            ),
           };
         }
         break;
-        
-      case 'age':
+
+      case "age":
         // Age filter
         if (value !== undefined && value !== null) {
           return {
-            age: createNumericFilterObject(value, modifier, 'EQUALS')
+            age: createNumericFilterObject(value, modifier, "EQUALS"),
           };
         }
         break;
-        
-      case 'ethnicity':
+
+      case "ethnicity":
         // Ethnicity filter
         if (value) {
           const ethnicityValue = extractSimpleValue(value);
@@ -592,14 +1141,14 @@
             return {
               ethnicity: {
                 value: ethnicityValue,
-                modifier: modifier || 'EQUALS'
-              }
+                modifier: modifier || "EQUALS",
+              },
             };
           }
         }
         break;
-        
-      case 'country':
+
+      case "country":
         // Country filter
         if (value) {
           const countryValue = extractSimpleValue(value);
@@ -607,14 +1156,14 @@
             return {
               country: {
                 value: countryValue,
-                modifier: modifier || 'EQUALS'
-              }
+                modifier: modifier || "EQUALS",
+              },
             };
           }
         }
         break;
-        
-      case 'hair_color':
+
+      case "hair_color":
         // Hair color filter
         if (value) {
           const hairColorValue = extractSimpleValue(value);
@@ -622,14 +1171,14 @@
             return {
               hair_color: {
                 value: hairColorValue,
-                modifier: modifier || 'EQUALS'
-              }
+                modifier: modifier || "EQUALS",
+              },
             };
           }
         }
         break;
-        
-      case 'eye_color':
+
+      case "eye_color":
         // Eye color filter
         if (value) {
           const eyeColorValue = extractSimpleValue(value);
@@ -637,56 +1186,72 @@
             return {
               eye_color: {
                 value: eyeColorValue,
-                modifier: modifier || 'EQUALS'
-              }
+                modifier: modifier || "EQUALS",
+              },
             };
           }
         }
         break;
-        
-      case 'scene_count':
+
+      case "scene_count":
         // Scene count filter
         if (value !== undefined && value !== null) {
           return {
-            scene_count: createNumericFilterObject(value, modifier, 'GREATER_THAN')
+            scene_count: createNumericFilterObject(
+              value,
+              modifier,
+              "GREATER_THAN",
+            ),
           };
         }
         break;
-        
-      case 'image_count':
+
+      case "image_count":
         // Image count filter
         if (value !== undefined && value !== null) {
           return {
-            image_count: createNumericFilterObject(value, modifier, 'GREATER_THAN')
+            image_count: createNumericFilterObject(
+              value,
+              modifier,
+              "GREATER_THAN",
+            ),
           };
         }
         break;
-        
-      case 'gallery_count':
+
+      case "gallery_count":
         // Gallery count filter
         if (value !== undefined && value !== null) {
           return {
-            gallery_count: createNumericFilterObject(value, modifier, 'GREATER_THAN')
+            gallery_count: createNumericFilterObject(
+              value,
+              modifier,
+              "GREATER_THAN",
+            ),
           };
         }
         break;
-        
-      case 'o_counter':
+
+      case "o_counter":
         // O-counter filter
         if (value !== undefined && value !== null) {
           return {
-            o_counter: createNumericFilterObject(value, modifier, 'GREATER_THAN')
+            o_counter: createNumericFilterObject(
+              value,
+              modifier,
+              "GREATER_THAN",
+            ),
           };
         }
         break;
-        
-      case 'stash_id':
-      case 'stash_id_endpoint':
+
+      case "stash_id":
+      case "stash_id_endpoint":
         // Stash ID filter - performer has a stash ID at a specific endpoint
         // Note: This filter intentionally does NOT use extractSimpleValue() because
         // the value itself is expected to be an object with stash_id and/or endpoint properties
         // The structure depends on what's in the value object
-        if (value && typeof value === 'object') {
+        if (value && typeof value === "object") {
           const stashIdFilter = {};
           if (value.stash_id) {
             stashIdFilter.stash_id = value.stash_id;
@@ -695,27 +1260,27 @@
             stashIdFilter.endpoint = value.endpoint;
           }
           if (Object.keys(stashIdFilter).length > 0) {
-            stashIdFilter.modifier = modifier || 'NOT_NULL';
+            stashIdFilter.modifier = modifier || "NOT_NULL";
             return {
-              stash_id_endpoint: stashIdFilter
+              stash_id_endpoint: stashIdFilter,
             };
           }
         }
         break;
-        
-      case 'is_missing':
+
+      case "is_missing":
         // Is missing filter
         if (value) {
           const missingValue = extractSimpleValue(value);
           if (missingValue) {
             return {
-              is_missing: missingValue
+              is_missing: missingValue,
             };
           }
         }
         break;
-        
-      case 'name':
+
+      case "name":
         // Name filter (text search)
         if (value) {
           const nameValue = extractSimpleValue(value);
@@ -723,15 +1288,15 @@
             return {
               name: {
                 value: nameValue,
-                modifier: modifier || 'INCLUDES'
-              }
+                modifier: modifier || "INCLUDES",
+              },
             };
           }
         }
         break;
-        
-      case 'alias':
-      case 'aliases':
+
+      case "alias":
+      case "aliases":
         // Alias filter
         if (value) {
           const aliasValue = extractSimpleValue(value);
@@ -739,14 +1304,14 @@
             return {
               aliases: {
                 value: aliasValue,
-                modifier: modifier || 'INCLUDES'
-              }
+                modifier: modifier || "INCLUDES",
+              },
             };
           }
         }
         break;
-        
-      case 'details':
+
+      case "details":
         // Details/bio filter
         if (value) {
           const detailsValue = extractSimpleValue(value);
@@ -754,14 +1319,14 @@
             return {
               details: {
                 value: detailsValue,
-                modifier: modifier || 'INCLUDES'
-              }
+                modifier: modifier || "INCLUDES",
+              },
             };
           }
         }
         break;
-        
-      case 'career_length':
+
+      case "career_length":
         // Career length filter
         if (value) {
           const careerValue = extractSimpleValue(value);
@@ -769,14 +1334,14 @@
             return {
               career_length: {
                 value: careerValue,
-                modifier: modifier || 'INCLUDES'
-              }
+                modifier: modifier || "INCLUDES",
+              },
             };
           }
         }
         break;
-        
-      case 'tattoos':
+
+      case "tattoos":
         // Tattoos filter
         if (value) {
           const tattoosValue = extractSimpleValue(value);
@@ -784,14 +1349,14 @@
             return {
               tattoos: {
                 value: tattoosValue,
-                modifier: modifier || 'INCLUDES'
-              }
+                modifier: modifier || "INCLUDES",
+              },
             };
           }
         }
         break;
-        
-      case 'piercings':
+
+      case "piercings":
         // Piercings filter
         if (value) {
           const piercingsValue = extractSimpleValue(value);
@@ -799,14 +1364,14 @@
             return {
               piercings: {
                 value: piercingsValue,
-                modifier: modifier || 'INCLUDES'
-              }
+                modifier: modifier || "INCLUDES",
+              },
             };
           }
         }
         break;
-        
-      case 'url':
+
+      case "url":
         // URL filter
         if (value) {
           const urlValue = extractSimpleValue(value);
@@ -814,14 +1379,14 @@
             return {
               url: {
                 value: urlValue,
-                modifier: modifier || 'INCLUDES'
-              }
+                modifier: modifier || "INCLUDES",
+              },
             };
           }
         }
         break;
-        
-      case 'birthdate':
+
+      case "birthdate":
         // Birthdate filter
         if (value) {
           const birthdateValue = extractSimpleValue(value);
@@ -829,14 +1394,14 @@
             return {
               birthdate: {
                 value: birthdateValue,
-                modifier: modifier || 'EQUALS'
-              }
+                modifier: modifier || "EQUALS",
+              },
             };
           }
         }
         break;
-        
-      case 'death_date':
+
+      case "death_date":
         // Death date filter
         if (value) {
           const deathDateValue = extractSimpleValue(value);
@@ -844,14 +1409,14 @@
             return {
               death_date: {
                 value: deathDateValue,
-                modifier: modifier || 'EQUALS'
-              }
+                modifier: modifier || "EQUALS",
+              },
             };
           }
         }
         break;
-        
-      case 'created_at':
+
+      case "created_at":
         // Created at filter
         if (value) {
           const createdValue = extractSimpleValue(value);
@@ -859,14 +1424,14 @@
             return {
               created_at: {
                 value: createdValue,
-                modifier: modifier || 'GREATER_THAN'
-              }
+                modifier: modifier || "GREATER_THAN",
+              },
             };
           }
         }
         break;
-        
-      case 'updated_at':
+
+      case "updated_at":
         // Updated at filter
         if (value) {
           const updatedValue = extractSimpleValue(value);
@@ -874,18 +1439,18 @@
             return {
               updated_at: {
                 value: updatedValue,
-                modifier: modifier || 'GREATER_THAN'
-              }
+                modifier: modifier || "GREATER_THAN",
+              },
             };
           }
         }
         break;
-        
+
       default:
         console.log(`[HotOrNot] Unknown criterion type: ${type}`);
         return null;
     }
-    
+
     return null;
   }
 
@@ -896,29 +1461,38 @@
   function getUrlPerformerFilter() {
     const criteria = parseUrlFilterCriteria();
     const filter = {};
-    
-    console.log('[HotOrNot] Converting', criteria.length, 'criteria to performer filter');
-    
+
+    console.log(
+      "[HotOrNot] Converting",
+      criteria.length,
+      "criteria to performer filter",
+    );
+
     for (const criterion of criteria) {
       const filterPart = convertCriterionToFilter(criterion);
       if (filterPart) {
-        console.log('[HotOrNot] Converted criterion:', criterion, 'to filter part:', filterPart);
+        console.log(
+          "[HotOrNot] Converted criterion:",
+          criterion,
+          "to filter part:",
+          filterPart,
+        );
         // Merge the filter part into the main filter
         // Handle nested AND/OR logic if needed
         Object.assign(filter, filterPart);
       } else {
-        console.log('[HotOrNot] Could not convert criterion:', criterion);
+        console.log("[HotOrNot] Could not convert criterion:", criterion);
       }
     }
-    
-    console.log('[HotOrNot] Final performer filter:', filter);
+
+    console.log("[HotOrNot] Final performer filter:", filter);
     return filter;
   }
 
   function createVictoryScreen(champion) {
     // Handle performers and images
     let title, imagePath;
-    
+
     if (battleType === "performers") {
       // Performer
       title = champion.name || `Performer #${champion.id}`;
@@ -926,19 +1500,23 @@
     } else {
       // Image
       title = `Image #${champion.id}`;
-      imagePath = champion.paths && champion.paths.thumbnail ? champion.paths.thumbnail : null;
+      imagePath =
+        champion.paths && champion.paths.thumbnail
+          ? champion.paths.thumbnail
+          : null;
     }
-    
+
     const itemType = battleType === "performers" ? "performers" : "images";
-    
+
     return `
       <div class="hon-victory-screen">
         <div class="hon-victory-crown">👑</div>
         <h2 class="hon-victory-title">CHAMPION!</h2>
         <div class="hon-victory-scene">
-          ${imagePath 
-            ? `<img class="hon-victory-image" src="${imagePath}" alt="${title}" />`
-            : `<div class="hon-victory-image hon-no-image">No Image</div>`
+          ${
+            imagePath
+              ? `<img class="hon-victory-image" src="${imagePath}" alt="${title}" />`
+              : `<div class="hon-victory-image hon-no-image">No Image</div>`
           }
         </div>
         <h3 class="hon-victory-name">${title}</h3>
@@ -951,10 +1529,10 @@
   function showPlacementScreen(item, rank, finalRating) {
     const comparisonArea = document.getElementById("hon-comparison-area");
     if (!comparisonArea) return;
-    
+
     // Handle performers and images
     let title, imagePath;
-    
+
     if (battleType === "performers") {
       // Performer
       title = item.name || `Performer #${item.id}`;
@@ -962,17 +1540,19 @@
     } else {
       // Image
       title = `Image #${item.id}`;
-      imagePath = item.paths && item.paths.thumbnail ? item.paths.thumbnail : null;
+      imagePath =
+        item.paths && item.paths.thumbnail ? item.paths.thumbnail : null;
     }
-    
+
     comparisonArea.innerHTML = `
       <div class="hon-victory-screen">
         <div class="hon-victory-crown">📍</div>
         <h2 class="hon-victory-title">PLACED!</h2>
         <div class="hon-victory-scene">
-          ${imagePath 
-            ? `<img class="hon-victory-image" src="${imagePath}" alt="${title}" />`
-            : `<div class="hon-victory-image hon-no-image">No Image</div>`
+          ${
+            imagePath
+              ? `<img class="hon-victory-image" src="${imagePath}" alt="${title}" />`
+              : `<div class="hon-victory-image hon-no-image">No Image</div>`
           }
         </div>
         <h3 class="hon-victory-name">${title}</h3>
@@ -983,13 +1563,13 @@
         <button id="hon-new-gauntlet" class="btn btn-primary">Start New Run</button>
       </div>
     `;
-    
+
     // Hide status and actions
     const statusEl = document.getElementById("hon-gauntlet-status");
     const actionsEl = document.querySelector(".hon-actions");
     if (statusEl) statusEl.style.display = "none";
     if (actionsEl) actionsEl.style.display = "none";
-    
+
     // Reset state
     gauntletFalling = false;
     gauntletFallingItem = null;
@@ -997,7 +1577,7 @@
     gauntletChampion = null;
     gauntletWins = 0;
     gauntletDefeated = [];
-    
+
     // Attach button handler
     const newBtn = comparisonArea.querySelector("#hon-new-gauntlet");
     if (newBtn) {
@@ -1008,7 +1588,12 @@
     }
   }
 
-  async function updatePerformerRating(performerId, newRating, performerObj = null, won = null) {
+  async function updatePerformerRating(
+    performerId,
+    newRating,
+    performerObj = null,
+    won = null,
+  ) {
     const mutation = `
       mutation UpdatePerformerCustomFields($id: ID!, $rating: Int!, $fields: Map) {
         performerUpdate(input: {
@@ -1024,30 +1609,29 @@
         }
       }
     `;
-  
+
     const variables = {
       id: performerId,
-      rating: Math.round(newRating)
+      rating: Math.round(newRating),
     };
-    
+
     // Update stats if performer object provided (won can be true/false/null)
     // won=true: winner with full stats, won=false: loser with full stats, won=null: participation only (no win/loss)
     // Check for won !== undefined to handle all three cases (true, false, null)
     if (performerObj && battleType === "performers" && won !== undefined) {
       const currentStats = parsePerformerEloData(performerObj);
-      
+
       // Update stats based on match outcome
       const newStats = updatePerformerStats(currentStats, won);
-      
+
       // Save stats as JSON string in custom field
       variables.fields = {
-        hotornot_stats: JSON.stringify(newStats)
+        hotornot_stats: JSON.stringify(newStats),
       };
     }
-    
+
     return await graphqlQuery(mutation, variables);
   }
-
 
   // ============================================
   // RATING LOGIC
@@ -1062,10 +1646,12 @@
    */
   function selectRandomOpponent(remainingOpponents, maxChoices = 3) {
     if (remainingOpponents.length === 0) return null;
-    
+
     // Get up to maxChoices closest opponents from the end of the array
     const closestOpponents = remainingOpponents.slice(-maxChoices);
-    return closestOpponents[Math.floor(Math.random() * closestOpponents.length)];
+    return closestOpponents[
+      Math.floor(Math.random() * closestOpponents.length)
+    ];
   }
 
   /**
@@ -1084,10 +1670,10 @@
         best_streak: 0,
         worst_streak: 0,
         last_match: null,
-        recent_results: 0
+        recent_results: 0,
       };
     }
-    
+
     // Check for Approach 2 stats (comprehensive tracking)
     if (performer.custom_fields.hotornot_stats) {
       try {
@@ -1101,13 +1687,16 @@
           best_streak: stats.best_streak || 0,
           worst_streak: stats.worst_streak || 0,
           last_match: stats.last_match || null,
-          recent_results: stats.recent_results || 0
+          recent_results: stats.recent_results || 0,
         };
       } catch (e) {
-        console.warn(`[HotOrNot] Failed to parse hotornot_stats for performer ${performer.id}:`, e);
+        console.warn(
+          `[HotOrNot] Failed to parse hotornot_stats for performer ${performer.id}:`,
+          e,
+        );
       }
     }
-    
+
     // Fallback to Approach 1 (match count only) for backward compatibility
     const eloMatches = performer.custom_fields.elo_matches;
     if (eloMatches) {
@@ -1121,10 +1710,10 @@
         best_streak: 0,
         worst_streak: 0,
         last_match: null,
-        recent_results: 0
+        recent_results: 0,
       };
     }
-    
+
     // No data - return empty stats
     return {
       total_matches: 0,
@@ -1135,7 +1724,7 @@
       best_streak: 0,
       worst_streak: 0,
       last_match: null,
-      recent_results: 0
+      recent_results: 0,
     };
   }
 
@@ -1149,9 +1738,9 @@
     // Base stats that always update
     const newStats = {
       total_matches: currentStats.total_matches + 1,
-      last_match: new Date().toISOString()
+      last_match: new Date().toISOString(),
     };
-    
+
     // If won is null, this is participation-only (gauntlet mode defender benchmark only)
     // Only increment match count and timestamp, don't track win/loss or streaks
     if (won === null) {
@@ -1164,7 +1753,7 @@
       newStats.recent_results = currentStats.recent_results || 0;
       return newStats;
     }
-    
+
     // Handle draw (skip) - counts as a tie, resets streak
     if (won === "draw") {
       newStats.wins = currentStats.wins;
@@ -1176,46 +1765,50 @@
       newStats.worst_streak = currentStats.worst_streak;
       // For trend tracking, draws count as 0 (loss) since they don't indicate a clear victory
       let recentResults = currentStats.recent_results || 0;
-      recentResults = (recentResults << 1) & 0x3FF; // Shift left, add 0 for draw, keep only 10 bits
+      recentResults = (recentResults << 1) & 0x3ff; // Shift left, add 0 for draw, keep only 10 bits
       newStats.recent_results = recentResults;
       return newStats;
     }
-    
+
     // Track win/loss
     newStats.wins = won ? currentStats.wins + 1 : currentStats.wins;
     newStats.losses = won ? currentStats.losses : currentStats.losses + 1;
     newStats.draws = currentStats.draws || 0;
-    
+
     // Calculate current streak
     if (won) {
       // Win: increment positive streak or start new positive streak
-      newStats.current_streak = currentStats.current_streak >= 0 
-        ? currentStats.current_streak + 1 
-        : 1;
+      newStats.current_streak =
+        currentStats.current_streak >= 0 ? currentStats.current_streak + 1 : 1;
     } else {
       // Loss: decrement negative streak or start new negative streak
-      newStats.current_streak = currentStats.current_streak <= 0 
-        ? currentStats.current_streak - 1 
-        : -1;
+      newStats.current_streak =
+        currentStats.current_streak <= 0 ? currentStats.current_streak - 1 : -1;
     }
-    
+
     // Update best/worst streaks
     if (newStats.current_streak > 0) {
-      newStats.best_streak = Math.max(currentStats.best_streak, newStats.current_streak);
+      newStats.best_streak = Math.max(
+        currentStats.best_streak,
+        newStats.current_streak,
+      );
       newStats.worst_streak = currentStats.worst_streak;
     } else {
       newStats.best_streak = currentStats.best_streak;
-      newStats.worst_streak = Math.min(currentStats.worst_streak, newStats.current_streak);
+      newStats.worst_streak = Math.min(
+        currentStats.worst_streak,
+        newStats.current_streak,
+      );
     }
-    
+
     // Update recent results bitmask for trend tracking
     // Each bit represents a match outcome: 1=win, 0=loss
     // Least significant bit is the most recent match
     let recentResults = currentStats.recent_results || 0;
     recentResults = (recentResults << 1) | (won ? 1 : 0); // Shift left and add new result
-    recentResults = recentResults & 0x3FF; // Keep only 10 bits (0x3FF = 1023)
+    recentResults = recentResults & 0x3ff; // Keep only 10 bits (0x3FF = 1023)
     newStats.recent_results = recentResults;
-    
+
     return newStats;
   }
 
@@ -1246,12 +1839,14 @@
   function getRatingConfidenceInterval(rating, matchCount) {
     const matches = matchCount || 0;
     const baseUncertainty = 15;
-    const uncertainty = Math.round(baseUncertainty / Math.sqrt(Math.max(1, matches)));
-    
+    const uncertainty = Math.round(
+      baseUncertainty / Math.sqrt(Math.max(1, matches)),
+    );
+
     return {
       low: Math.max(1, rating - uncertainty),
       high: Math.min(100, rating + uncertainty),
-      matches: matches
+      matches: matches,
     };
   }
 
@@ -1277,13 +1872,13 @@
   }
 
   // Constants for streak-based adjustments
-  const STREAK_THRESHOLD_MODERATE = 3;  // Streak length to trigger moderate bonus
-  const STREAK_THRESHOLD_STRONG = 5;    // Streak length to trigger strong bonus
-  const STREAK_RATING_MULTIPLIER = 2;   // Rating points adjustment per streak count
+  const STREAK_THRESHOLD_MODERATE = 3; // Streak length to trigger moderate bonus
+  const STREAK_THRESHOLD_STRONG = 5; // Streak length to trigger strong bonus
+  const STREAK_RATING_MULTIPLIER = 2; // Rating points adjustment per streak count
 
   /**
    * Calculate streak-based weight modifier for matchmaking.
-   * Performers on streaks (hot or cold) get a weight bonus to give 
+   * Performers on streaks (hot or cold) get a weight bonus to give
    * opportunities to continue or break their streaks.
    * @param {Object} stats - Stats object from parsePerformerEloData
    * @returns {number} Weight multiplier (1.0 = no bonus, higher = more likely to be selected)
@@ -1291,12 +1886,12 @@
   function getStreakWeight(stats) {
     const streak = stats.current_streak || 0;
     const absStreak = Math.abs(streak);
-    
+
     // No bonus for performers without significant streaks
     if (absStreak < STREAK_THRESHOLD_MODERATE) {
       return 1.0;
     }
-    
+
     // Strong streak bonus (5+): 1.5x weight
     // Moderate streak bonus (3-4): 1.3x weight
     // This gives streaking performers slightly higher chance to be selected
@@ -1329,7 +1924,7 @@
     if (!stats.recent_results || stats.total_matches < 5) {
       return { trend: "new", emoji: "⚡", label: "New" };
     }
-    
+
     // Count wins in recent results using Brian Kernighan's bit counting algorithm
     let recentWins = 0;
     let n = stats.recent_results;
@@ -1337,11 +1932,11 @@
       recentWins++;
       n &= n - 1; // Clear the least significant set bit
     }
-    
+
     const recentMatches = Math.min(10, stats.total_matches);
     const recentWinRate = recentWins / recentMatches;
     const overallWinRate = stats.wins / stats.total_matches;
-    
+
     if (recentWinRate > overallWinRate + 0.2) {
       return { trend: "rising", emoji: "📈", label: "Rising" };
     }
@@ -1359,9 +1954,14 @@
    * @param {number} sceneCount - Number of scenes the performer is in (performers only)
    * @returns {number} K-factor value
    */
-  function getKFactor(currentRating, matchCount = null, mode = "swiss", sceneCount = null) {
+  function getKFactor(
+    currentRating,
+    matchCount = null,
+    mode = "swiss",
+    sceneCount = null,
+  ) {
     let baseKFactor;
-    
+
     // If match count is available, use it for more accurate K-factor
     // K-factor ranges follow a reduced USCF/FIDE approach for slower rating changes:
     // This makes it harder to jump to extreme ratings quickly
@@ -1383,23 +1983,23 @@
       // Items near the default rating (50) are likely less established
       // Items far from 50 have likely had more comparisons
       const distanceFromDefault = Math.abs(currentRating - 50);
-      
+
       if (distanceFromDefault < 10) {
-        baseKFactor = 14;  // Higher K for unproven items near default (reduced from 24)
+        baseKFactor = 14; // Higher K for unproven items near default (reduced from 24)
       } else if (distanceFromDefault < 25) {
-        baseKFactor = 10;  // Medium K for moderately established items (reduced from 20)
+        baseKFactor = 10; // Medium K for moderately established items (reduced from 20)
       } else {
-        baseKFactor = 8;   // Lower K for well-established items (reduced from 16)
+        baseKFactor = 8; // Lower K for well-established items (reduced from 16)
       }
     }
-    
+
     // Apply scene count weighting for performers
     // Performers with more scenes get lower K-factor (more stable ratings)
-    // This reflects that performers with extensive filmography have more "evidence" 
+    // This reflects that performers with extensive filmography have more "evidence"
     // of their quality and their rating should be more stable
     if (sceneCount !== null && sceneCount !== undefined && sceneCount > 0) {
       let sceneMultiplier = 1.0;
-      
+
       if (sceneCount >= 100) {
         // Very prolific performers: 50% K-factor (very stable)
         sceneMultiplier = 0.5;
@@ -1414,17 +2014,17 @@
         sceneMultiplier = 0.9;
       }
       // Performers with < 10 scenes: full K-factor (no reduction)
-      
+
       baseKFactor = Math.max(2, Math.round(baseKFactor * sceneMultiplier));
     }
-    
+
     // Apply mode-specific multiplier
     // Champion mode: 0.5x K-factor (half the rating change of Swiss mode)
     // This allows ratings to update but at a much slower pace
     if (mode === "champion") {
       return Math.max(1, Math.round(baseKFactor * 0.5));
     }
-    
+
     // Swiss and gauntlet modes use full K-factor
     return baseKFactor;
   }
@@ -1439,7 +2039,7 @@
    */
   function applyDiminishingReturns(currentRating, baseGain) {
     if (baseGain <= 0) return baseGain;
-    
+
     // Calculate how close we are to the ceiling (100)
     // The multiplier decreases as we approach 100
     // At rating 50: multiplier = 1.0 (full gain)
@@ -1447,18 +2047,18 @@
     // At rating 90: multiplier = 0.04
     // At rating 95: multiplier = 0.01
     const distanceFromCeiling = 100 - currentRating;
-    
+
     // Use a quadratic curve for smooth diminishing returns
     // Formula: multiplier = (distance / 50)^2, clamped between 0 and 1
     // This creates a smooth curve that gets progressively steeper near 100
     const multiplier = Math.min(1, Math.pow(distanceFromCeiling / 50, 2));
-    
+
     // Ensure at least 1 point can be gained if baseGain > 0 and not at the absolute ceiling
     const adjustedGain = Math.round(baseGain * multiplier);
-    
+
     // At rating 100, no more gains possible
     if (currentRating >= 100) return 0;
-    
+
     // Otherwise ensure at least 1 point gain when baseGain > 0
     return Math.max(1, adjustedGain);
   }
@@ -1476,67 +2076,83 @@
     if (currentMode === "swiss") {
       return true;
     }
-    
+
     // In Champion mode, all participants are active (both get full stats tracked)
     if (currentMode === "champion") {
       return true;
     }
-    
+
     // In Gauntlet mode, only champion/falling performers are active
     if (currentMode === "gauntlet") {
       // Check if this is the champion
-      const isChampion = gauntletChampion && performerId === gauntletChampion.id;
-      
+      const isChampion =
+        gauntletChampion && performerId === gauntletChampion.id;
+
       // Check if this is the falling performer
-      const isFalling = gauntletFalling && gauntletFallingItem && performerId === gauntletFallingItem.id;
-      
+      const isFalling =
+        gauntletFalling &&
+        gauntletFallingItem &&
+        performerId === gauntletFallingItem.id;
+
       // Champion or falling performer are always active
       if (isChampion || isFalling) {
         return true;
       }
-      
+
       // Defender at rank #1 who is being challenged is also active (they can lose rating)
       if (performerRank === 1) {
         return true;
       }
-      
+
       // All other defenders are not active (they're just benchmarks)
       return false;
     }
-    
+
     // Default: not active
     return false;
   }
 
-  async function handleComparison(winnerId, loserId, winnerCurrentRating, loserCurrentRating, loserRank = null, winnerObj = null, loserObj = null) {
+  async function handleComparison(
+    winnerId,
+    loserId,
+    winnerCurrentRating,
+    loserCurrentRating,
+    loserRank = null,
+    winnerObj = null,
+    loserObj = null,
+  ) {
     const winnerRating = winnerCurrentRating || 50;
     const loserRating = loserCurrentRating || 50;
-    
+
     const ratingDiff = loserRating - winnerRating;
-    
+
     // Fetch fresh performer data to ensure we have current stats
     // This prevents stats from being overwritten when performers have consecutive matches
     let freshWinnerObj = winnerObj;
     let freshLoserObj = loserObj;
-    
+
     if (battleType === "performers") {
       // Fetch both performers in parallel for better performance
       const [fetchedWinner, fetchedLoser] = await Promise.all([
-        (winnerObj && winnerId) ? fetchPerformerById(winnerId) : Promise.resolve(null),
-        (loserObj && loserId) ? fetchPerformerById(loserId) : Promise.resolve(null)
+        winnerObj && winnerId
+          ? fetchPerformerById(winnerId)
+          : Promise.resolve(null),
+        loserObj && loserId
+          ? fetchPerformerById(loserId)
+          : Promise.resolve(null),
       ]);
-      
+
       freshWinnerObj = fetchedWinner || winnerObj;
       freshLoserObj = fetchedLoser || loserObj;
     }
-    
+
     // Parse match counts from custom fields (only for performers)
     let winnerMatchCount = null;
     let loserMatchCount = null;
     // Extract scene counts for K-factor weighting (performers only)
     let winnerSceneCount = null;
     let loserSceneCount = null;
-    
+
     if (battleType === "performers" && freshWinnerObj) {
       const winnerStats = parsePerformerEloData(freshWinnerObj);
       winnerMatchCount = winnerStats.total_matches;
@@ -1547,37 +2163,59 @@
       loserMatchCount = loserStats.total_matches;
       loserSceneCount = freshLoserObj.scene_count || null;
     }
-    
-    let winnerGain = 0, loserLoss = 0;
-    
+
+    let winnerGain = 0,
+      loserLoss = 0;
+
     if (currentMode === "gauntlet") {
       // In gauntlet, only the champion/falling item changes rating
       // Defenders stay the same (they're just benchmarks)
       // EXCEPT: if the defender is rank #1, they get a full ELO penalty when defeated
       // to ensure rankings remain fluid and upsets are properly reflected
-      const isChampionWinner = gauntletChampion && winnerId === gauntletChampion.id;
-      const isFallingWinner = gauntletFalling && gauntletFallingItem && winnerId === gauntletFallingItem.id;
-      const isChampionLoser = gauntletChampion && loserId === gauntletChampion.id;
-      const isFallingLoser = gauntletFalling && gauntletFallingItem && loserId === gauntletFallingItem.id;
-      
+      const isChampionWinner =
+        gauntletChampion && winnerId === gauntletChampion.id;
+      const isFallingWinner =
+        gauntletFalling &&
+        gauntletFallingItem &&
+        winnerId === gauntletFallingItem.id;
+      const isChampionLoser =
+        gauntletChampion && loserId === gauntletChampion.id;
+      const isFallingLoser =
+        gauntletFalling &&
+        gauntletFallingItem &&
+        loserId === gauntletFallingItem.id;
+
       const expectedWinner = 1 / (1 + Math.pow(10, ratingDiff / 40));
-      const kFactor = getKFactor(winnerRating, winnerMatchCount, "gauntlet", winnerSceneCount);
-      
+      const kFactor = getKFactor(
+        winnerRating,
+        winnerMatchCount,
+        "gauntlet",
+        winnerSceneCount,
+      );
+
       // Only the active item (champion or falling) gets rating changes
       if (isChampionWinner || isFallingWinner) {
-        const baseGain = Math.max(0, Math.round(kFactor * (1 - expectedWinner)));
+        const baseGain = Math.max(
+          0,
+          Math.round(kFactor * (1 - expectedWinner)),
+        );
         // Apply diminishing returns - harder to gain points at higher ratings
         winnerGain = applyDiminishingReturns(winnerRating, baseGain);
       }
       if (isChampionLoser || isFallingLoser) {
         loserLoss = Math.max(0, Math.round(kFactor * expectedWinner));
       }
-      
+
       // Special case: if defender was rank #1 and lost, apply full ELO penalty
       // The ELO formula naturally penalizes the #1 significantly because their
       // "Expected Score" was nearly 100%, making the upset very costly
       if (loserRank === 1 && !isChampionLoser && !isFallingLoser) {
-        const loserK = getKFactor(loserRating, loserMatchCount, "gauntlet", loserSceneCount);
+        const loserK = getKFactor(
+          loserRating,
+          loserMatchCount,
+          "gauntlet",
+          loserSceneCount,
+        );
         // expectedWinner is from winner's perspective, so expectedLoser = 1 - expectedWinner
         // loserLoss = K * (1 - expectedLoser) = K * expectedWinner (same as normal ELO loss)
         loserLoss = Math.max(1, Math.round(loserK * expectedWinner));
@@ -1586,11 +2224,21 @@
       // Champion mode: Both performers get rating updates, but at a reduced rate (50% of Swiss mode)
       // This allows rankings to evolve while still maintaining the "winner stays on" feel
       const expectedWinner = 1 / (1 + Math.pow(10, ratingDiff / 40));
-      
+
       // Use individual K-factors for each performer with champion mode multiplier
-      const winnerK = getKFactor(winnerRating, winnerMatchCount, "champion", winnerSceneCount);
-      const loserK = getKFactor(loserRating, loserMatchCount, "champion", loserSceneCount);
-      
+      const winnerK = getKFactor(
+        winnerRating,
+        winnerMatchCount,
+        "champion",
+        winnerSceneCount,
+      );
+      const loserK = getKFactor(
+        loserRating,
+        loserMatchCount,
+        "champion",
+        loserSceneCount,
+      );
+
       // Calculate changes using their respective K-factors (reduced by 50% for champion mode)
       const baseGain = Math.max(0, Math.round(winnerK * (1 - expectedWinner)));
       // Apply diminishing returns - harder to gain points at higher ratings
@@ -1600,25 +2248,35 @@
       // Swiss mode: True ELO with zero-sum property
       // Both performers change by the same amount to maintain rating pool integrity
       const expectedWinner = 1 / (1 + Math.pow(10, ratingDiff / 40));
-      
+
       // Use individual K-factors but average them for the match
       // This maintains fairness while preserving zero-sum property
-      const winnerK = getKFactor(winnerRating, winnerMatchCount, "swiss", winnerSceneCount);
-      const loserK = getKFactor(loserRating, loserMatchCount, "swiss", loserSceneCount);
+      const winnerK = getKFactor(
+        winnerRating,
+        winnerMatchCount,
+        "swiss",
+        winnerSceneCount,
+      );
+      const loserK = getKFactor(
+        loserRating,
+        loserMatchCount,
+        "swiss",
+        loserSceneCount,
+      );
       const avgK = (winnerK + loserK) / 2;
-      
+
       // Calculate single rating change for zero-sum (winner gains what loser loses)
       const baseChange = Math.max(0, Math.round(avgK * (1 - expectedWinner)));
-      
+
       // Apply diminishing returns based on winner's rating (makes reaching 100 harder)
       // Then set loser's loss equal to winner's gain (zero-sum)
       winnerGain = applyDiminishingReturns(winnerRating, baseChange);
       loserLoss = winnerGain; // Zero-sum: loser loses exactly what winner gains
     }
-    
+
     let newWinnerRating = Math.min(100, Math.max(1, winnerRating + winnerGain));
     let newLoserRating = Math.min(100, Math.max(1, loserRating - loserLoss));
-    
+
     // Ensure the winner moves to at least the same ranking as the loser (or higher)
     // If the ELO movement alone doesn't achieve this, adjust the ratings to ensure
     // the winner ranks above the loser after a direct head-to-head victory
@@ -1634,44 +2292,77 @@
         newWinnerRating = newLoserRating + 1;
       }
     }
-    
+
     const winnerChange = newWinnerRating - winnerRating;
     const loserChange = newLoserRating - loserRating;
-    
+
     // Determine which participants should have stats tracked
-    const winnerRank = winnerId === currentPair.left?.id ? currentRanks.left : currentRanks.right;
-    
+    const winnerRank =
+      winnerId === currentPair.left?.id
+        ? currentRanks.left
+        : currentRanks.right;
+
     // In champion/gauntlet mode with no champion yet (first match), both participants should get full stats tracked
-    const isFirstMatchInGauntletMode = (currentMode === "gauntlet" || currentMode === "champion") && !gauntletChampion;
-    const shouldTrackWinner = battleType === "performers" && (isActiveParticipant(winnerId, winnerRank) || isFirstMatchInGauntletMode);
-    const shouldTrackLoser = battleType === "performers" && (isActiveParticipant(loserId, loserRank) || isFirstMatchInGauntletMode);
-    
+    const isFirstMatchInGauntletMode =
+      (currentMode === "gauntlet" || currentMode === "champion") &&
+      !gauntletChampion;
+    const shouldTrackWinner =
+      battleType === "performers" &&
+      (isActiveParticipant(winnerId, winnerRank) || isFirstMatchInGauntletMode);
+    const shouldTrackLoser =
+      battleType === "performers" &&
+      (isActiveParticipant(loserId, loserRank) || isFirstMatchInGauntletMode);
+
     // Update items in Stash
     // Pass win/loss status for stats tracking:
     // - true/false for active participants (track full stats)
     // - null for defenders in gauntlet mode only (track participation only)
-    
+
     // Winner updates
-    if (winnerChange !== 0 || (battleType === "performers" && freshWinnerObj && shouldTrackWinner)) {
+    if (
+      winnerChange !== 0 ||
+      (battleType === "performers" && freshWinnerObj && shouldTrackWinner)
+    ) {
       // Update rating if changed, or always update stats if active participant
-      updateItemRating(winnerId, newWinnerRating, shouldTrackWinner ? freshWinnerObj : null, shouldTrackWinner ? true : null);
-    } else if (battleType === "performers" && freshWinnerObj && currentMode === "gauntlet") {
+      updateItemRating(
+        winnerId,
+        newWinnerRating,
+        shouldTrackWinner ? freshWinnerObj : null,
+        shouldTrackWinner ? true : null,
+      );
+    } else if (
+      battleType === "performers" &&
+      freshWinnerObj &&
+      currentMode === "gauntlet"
+    ) {
       // Defender in gauntlet mode only - track participation only
       updateItemRating(winnerId, newWinnerRating, freshWinnerObj, null);
     }
-    
+
     // Loser updates
-    if (loserChange !== 0 || (battleType === "performers" && freshLoserObj && shouldTrackLoser)) {
+    if (
+      loserChange !== 0 ||
+      (battleType === "performers" && freshLoserObj && shouldTrackLoser)
+    ) {
       // Update rating if changed, or always update stats if active participant
-      updateItemRating(loserId, newLoserRating, shouldTrackLoser ? freshLoserObj : null, shouldTrackLoser ? false : null);
-    } else if (battleType === "performers" && freshLoserObj && currentMode === "gauntlet") {
+      updateItemRating(
+        loserId,
+        newLoserRating,
+        shouldTrackLoser ? freshLoserObj : null,
+        shouldTrackLoser ? false : null,
+      );
+    } else if (
+      battleType === "performers" &&
+      freshLoserObj &&
+      currentMode === "gauntlet"
+    ) {
       // Defender in gauntlet mode only - track participation only
       updateItemRating(loserId, newLoserRating, freshLoserObj, null);
     }
-    
+
     return { newWinnerRating, newLoserRating, winnerChange, loserChange };
   }
-  
+
   /**
    * Handle skip as an ELO draw between two items.
    * In standard ELO, a draw gives both players a score of 0.5 (instead of 1 for win, 0 for loss).
@@ -1686,29 +2377,29 @@
       console.log("[HotOrNot] Skip: Missing items, no rating update");
       return;
     }
-    
+
     const leftRating = leftItem.rating100 || 50;
     const rightRating = rightItem.rating100 || 50;
-    
+
     // Fetch fresh performer data to ensure we have current stats
     let freshLeftItem = leftItem;
     let freshRightItem = rightItem;
-    
+
     if (battleType === "performers") {
       const [fetchedLeft, fetchedRight] = await Promise.all([
         fetchPerformerById(leftItem.id),
-        fetchPerformerById(rightItem.id)
+        fetchPerformerById(rightItem.id),
       ]);
       freshLeftItem = fetchedLeft || leftItem;
       freshRightItem = fetchedRight || rightItem;
     }
-    
+
     // Parse match counts for K-factor calculation
     let leftMatchCount = null;
     let rightMatchCount = null;
     let leftSceneCount = null;
     let rightSceneCount = null;
-    
+
     if (battleType === "performers" && freshLeftItem) {
       const leftStats = parsePerformerEloData(freshLeftItem);
       leftMatchCount = leftStats.total_matches;
@@ -1719,24 +2410,34 @@
       rightMatchCount = rightStats.total_matches;
       rightSceneCount = freshRightItem.scene_count || null;
     }
-    
+
     // Calculate expected scores for both items
     // Rating diff from left's perspective: (rightRating - leftRating)
     const ratingDiffLeft = rightRating - leftRating;
     const expectedLeft = 1 / (1 + Math.pow(10, ratingDiffLeft / 40));
     const expectedRight = 1 - expectedLeft;
-    
+
     // Get K-factors for both items
-    const leftK = getKFactor(leftRating, leftMatchCount, currentMode, leftSceneCount);
-    const rightK = getKFactor(rightRating, rightMatchCount, currentMode, rightSceneCount);
-    
+    const leftK = getKFactor(
+      leftRating,
+      leftMatchCount,
+      currentMode,
+      leftSceneCount,
+    );
+    const rightK = getKFactor(
+      rightRating,
+      rightMatchCount,
+      currentMode,
+      rightSceneCount,
+    );
+
     // Draw gives score of 0.5 to both
     // Change = K * (0.5 - Expected)
     // If Expected > 0.5 (favorite), you lose rating for drawing
     // If Expected < 0.5 (underdog), you gain rating for drawing
     let leftChange = Math.round(leftK * (0.5 - expectedLeft));
     let rightChange = Math.round(rightK * (0.5 - expectedRight));
-    
+
     // Ensure there's a minimum effect when there's a significant rating difference
     // If ratings differ by at least 5 points, ensure at least a 1-point change
     // This prevents "skip does nothing" when there's a noticeable rating gap
@@ -1751,21 +2452,36 @@
         rightChange = -1;
       }
     }
-    
+
     const newLeftRating = Math.min(100, Math.max(1, leftRating + leftChange));
-    const newRightRating = Math.min(100, Math.max(1, rightRating + rightChange));
-    
-    console.log(`[HotOrNot] Skip (Draw): Left ${leftRating} -> ${newLeftRating} (${leftChange >= 0 ? '+' : ''}${leftChange}), Right ${rightRating} -> ${newRightRating} (${rightChange >= 0 ? '+' : ''}${rightChange})`);
-    
+    const newRightRating = Math.min(
+      100,
+      Math.max(1, rightRating + rightChange),
+    );
+
+    console.log(
+      `[HotOrNot] Skip (Draw): Left ${leftRating} -> ${newLeftRating} (${leftChange >= 0 ? "+" : ""}${leftChange}), Right ${rightRating} -> ${newRightRating} (${rightChange >= 0 ? "+" : ""}${rightChange})`,
+    );
+
     // Update ratings and stats for both items
     if (battleType === "performers") {
       // Update left item with draw stats
       if (leftChange !== 0 || freshLeftItem) {
-        await updateItemRating(leftItem.id, newLeftRating, freshLeftItem, "draw");
+        await updateItemRating(
+          leftItem.id,
+          newLeftRating,
+          freshLeftItem,
+          "draw",
+        );
       }
       // Update right item with draw stats
       if (rightChange !== 0 || freshRightItem) {
-        await updateItemRating(rightItem.id, newRightRating, freshRightItem, "draw");
+        await updateItemRating(
+          rightItem.id,
+          newRightRating,
+          freshRightItem,
+          "draw",
+        );
       }
     } else {
       // For images, only update if rating changed
@@ -1776,15 +2492,15 @@
         await updateItemRating(rightItem.id, newRightRating);
       }
     }
-    
-    return { 
-      leftRating: newLeftRating, 
+
+    return {
+      leftRating: newLeftRating,
       rightRating: newRightRating,
       leftChange,
-      rightChange
+      rightChange,
     };
   }
-  
+
   // Called when gauntlet champion loses - place them one below the winner
   function finalizeGauntletLoss(championId, winnerRating) {
     // Set champion rating to just below the item that beat them
@@ -1804,7 +2520,7 @@
     if (!defeatedIds || defeatedIds.length === 0) {
       return 1;
     }
-    
+
     // Fetch each defeated performer by ID individually
     // (PerformerFilterType doesn't support filtering by id directly)
     const defeatedQuery = `
@@ -1815,33 +2531,39 @@
         }
       }
     `;
-    
+
     const performerPromises = defeatedIds.map(async (id) => {
       try {
         const result = await graphqlQuery(defeatedQuery, { id });
         return result.findPerformer;
       } catch (error) {
-        console.error(`[HotOrNot] Error fetching defeated performer ${id}:`, error);
+        console.error(
+          `[HotOrNot] Error fetching defeated performer ${id}:`,
+          error,
+        );
         return null;
       }
     });
-    
-    const defeatedPerformers = (await Promise.all(performerPromises)).filter(p => p !== null);
+
+    const defeatedPerformers = (await Promise.all(performerPromises)).filter(
+      (p) => p !== null,
+    );
     if (defeatedPerformers.length > 0) {
       // Floor is 1 point above the highest-rated defeated performer
-      const maxDefeatedRating = Math.max(...defeatedPerformers.map(p => p.rating100 || 50));
+      const maxDefeatedRating = Math.max(
+        ...defeatedPerformers.map((p) => p.rating100 || 50),
+      );
       return maxDefeatedRating + 1;
     }
-    
+
     return 1;
   }
-
 
   // ============================================
   // PERFORMER FUNCTIONS
   // ============================================
 
-async function fetchPerformerCount(performerFilter = {}) {
+  async function fetchPerformerCount(performerFilter = {}) {
     const countQuery = `
       query FindPerformers($performer_filter: PerformerFilterType) {
         findPerformers(performer_filter: $performer_filter, filter: { per_page: 0 }) {
@@ -1849,7 +2571,9 @@ async function fetchPerformerCount(performerFilter = {}) {
         }
       }
     `;
-    const countResult = await graphqlQuery(countQuery, { performer_filter: performerFilter });
+    const countResult = await graphqlQuery(countQuery, {
+      performer_filter: performerFilter,
+    });
     return countResult.findPerformers.count;
   }
 
@@ -1864,15 +2588,17 @@ async function fetchPerformerCount(performerFilter = {}) {
     if (selectedGenders.length > 0) {
       filter.gender = {
         value_list: selectedGenders,
-        modifier: "INCLUDES"
+        modifier: "INCLUDES",
       };
     }
 
     // Exclude performers with missing default image when no other URL filters are active
-    const hasOtherUserFilters = Object.keys(urlFilter).some(k => k !== "gender");
+    const hasOtherUserFilters = Object.keys(urlFilter).some(
+      (k) => k !== "gender",
+    );
     if (!hasOtherUserFilters && !filter.NOT) {
       filter.NOT = {
-        is_missing: "image"
+        is_missing: "image",
       };
     }
 
@@ -1893,14 +2619,16 @@ async function fetchPerformerCount(performerFilter = {}) {
     // Exact gender match for this battle
     filter.gender = {
       value: gender,
-      modifier: "EQUALS"
+      modifier: "EQUALS",
     };
 
     // Exclude performers with missing default image when no other URL filters are active
-    const hasOtherUserFilters = Object.keys(urlFilter).some(k => k !== "gender");
+    const hasOtherUserFilters = Object.keys(urlFilter).some(
+      (k) => k !== "gender",
+    );
     if (!hasOtherUserFilters && !filter.NOT) {
       filter.NOT = {
-        is_missing: "image"
+        is_missing: "image",
       };
     }
 
@@ -1908,17 +2636,18 @@ async function fetchPerformerCount(performerFilter = {}) {
   }
 
   async function fetchRandomPerformers(count = 2) {
-  if (selectedGenders.length === 0) {
-    throw new Error("No genders selected. Please select at least one gender in the filter.");
-  }
-  const battleGender = selectedGenders[Math.floor(Math.random() * selectedGenders.length)];
-  const performerFilter = getPerformerFilterForGender(battleGender);
-  const totalPerformers = await fetchPerformerCount(performerFilter);
-  if (totalPerformers < 2) {
-    throw new Error("Not enough performers for comparison. You need at least 2 performers matching the selected gender.");
-  }
+    if (selectedGenders.length === 0) {
+      throw new Error(
+        "No genders selected. Please select at least one gender in the filter.",
+      );
+    }
 
-  const performerQuery = `
+    // Shuffle the selected genders so we try them in a random order.
+    // This avoids always failing on the same low-count gender when other genders
+    // have plenty of performers (which was causing spurious "not enough" errors).
+    const genderOrder = selectedGenders.slice().sort(() => Math.random() - 0.5);
+
+    const performerQuery = `
     query FindRandomPerformers($performer_filter: PerformerFilterType, $filter: FindFilterType) {
       findPerformers(performer_filter: $performer_filter, filter: $filter) {
         performers {
@@ -1928,23 +2657,31 @@ async function fetchPerformerCount(performerFilter = {}) {
     }
   `;
 
-  const result = await graphqlQuery(performerQuery, {
-    performer_filter: performerFilter,
-    filter: {
-      per_page: Math.min(100, totalPerformers),
-      sort: "random"
+    for (const battleGender of genderOrder) {
+      const performerFilter = getPerformerFilterForGender(battleGender);
+      const totalPerformers = await fetchPerformerCount(performerFilter);
+      if (totalPerformers < 2) continue;
+
+      const result = await graphqlQuery(performerQuery, {
+        performer_filter: performerFilter,
+        filter: {
+          per_page: Math.min(100, totalPerformers),
+          sort: "random",
+        },
+      });
+
+      const allPerformers = result.findPerformers.performers || [];
+      if (allPerformers.length < 2) continue;
+
+      const shuffled = allPerformers.sort(() => Math.random() - 0.5);
+      return shuffled.slice(0, 2);
     }
-  });
 
-  const allPerformers = result.findPerformers.performers || [];
-  
-  if (allPerformers.length < 2) {
-    throw new Error("Not enough performers for comparison. You need at least 2 performers.");
+    // All attempted genders had fewer than 2 performers
+    throw new Error(
+      "Not enough performers for comparison. You need at least 2 performers matching the selected genders.",
+    );
   }
-
-  const shuffled = allPerformers.sort(() => Math.random() - 0.5);
-  return shuffled.slice(0, 2);
-}
 
   /**
    * Fetch the latest performer data by ID to get current stats
@@ -1956,7 +2693,7 @@ async function fetchPerformerCount(performerFilter = {}) {
     if (!performerId?.trim?.()) {
       return null;
     }
-    
+
     const performerQuery = `
       query FindPerformer($id: ID!) {
         findPerformer(id: $id) {
@@ -1964,12 +2701,15 @@ async function fetchPerformerCount(performerFilter = {}) {
         }
       }
     `;
-    
+
     try {
       const result = await graphqlQuery(performerQuery, { id: performerId });
       return result.findPerformer || null;
     } catch (error) {
-      console.error(`[HotOrNot] Error fetching performer ${performerId}:`, error);
+      console.error(
+        `[HotOrNot] Error fetching performer ${performerId}:`,
+        error,
+      );
       return null;
     }
   }
@@ -1983,7 +2723,7 @@ async function fetchPerformerCount(performerFilter = {}) {
    */
   function getRecencyWeight(performer) {
     const stats = parsePerformerEloData(performer);
-    
+
     // Calculate match count weight component
     // Performers with fewer matches get higher weights
     // 0 matches: weight = 3.0 (highest priority - never been matched)
@@ -2003,26 +2743,26 @@ async function fetchPerformerCount(performerFilter = {}) {
     } else {
       matchCountWeight = 0.5;
     }
-    
+
     // Calculate recency weight component
     let recencyWeight = 1.0;
-    
+
     if (stats.last_match) {
       try {
         const lastMatchDate = new Date(stats.last_match);
-        
+
         // Check for invalid date
         if (!isNaN(lastMatchDate.getTime())) {
           const lastMatchTime = lastMatchDate.getTime();
           const now = Date.now();
           const hoursSinceMatch = (now - lastMatchTime) / (1000 * 60 * 60);
-          
+
           // Weight calculation:
           // 0-1 hours ago: weight = 0.1 (very unlikely)
           // 1-6 hours ago: weight = 0.3 (less likely)
           // 6-24 hours ago: weight = 0.6 (moderately likely)
           // 24+ hours ago: weight = 1.0 (full probability)
-          
+
           if (hoursSinceMatch < 1) {
             recencyWeight = 0.1;
           } else if (hoursSinceMatch < 6) {
@@ -2035,14 +2775,17 @@ async function fetchPerformerCount(performerFilter = {}) {
         }
       } catch (e) {
         // If date parsing fails, use default recency weight
-        console.warn(`[HotOrNot] Failed to parse last_match for performer ${performer.id}:`, e);
+        console.warn(
+          `[HotOrNot] Failed to parse last_match for performer ${performer.id}:`,
+          e,
+        );
       }
     }
-    
+
     // Calculate streak weight component
     // Performers on streaks get a bonus to give opportunities for streak continuation/breaking
     const streakWeight = getStreakWeight(stats);
-    
+
     // Combine weights: multiply all factors together
     // This ensures match count, recency, and streak all contribute to the final selection probability
     return matchCountWeight * recencyWeight * streakWeight;
@@ -2060,35 +2803,41 @@ async function fetchPerformerCount(performerFilter = {}) {
       console.error("[HotOrNot] weightedRandomSelect called with empty arrays");
       return null;
     }
-    
+
     if (items.length !== weights.length) {
-      console.error("[HotOrNot] weightedRandomSelect: items and weights arrays have different lengths");
+      console.error(
+        "[HotOrNot] weightedRandomSelect: items and weights arrays have different lengths",
+      );
       return null;
     }
-    
+
     // Validate that all weights are numeric
-    if (!weights.every(w => typeof w === 'number' && !isNaN(w))) {
-      console.error("[HotOrNot] weightedRandomSelect: weights array contains non-numeric values");
+    if (!weights.every((w) => typeof w === "number" && !isNaN(w))) {
+      console.error(
+        "[HotOrNot] weightedRandomSelect: weights array contains non-numeric values",
+      );
       return null;
     }
-    
+
     const totalWeight = weights.reduce((sum, w) => sum + w, 0);
-    
+
     // Handle edge case of all zero or negative weights
     if (totalWeight <= 0) {
-      console.error("[HotOrNot] Total weight is zero or negative - this indicates a logic error");
+      console.error(
+        "[HotOrNot] Total weight is zero or negative - this indicates a logic error",
+      );
       return items[Math.floor(Math.random() * items.length)];
     }
-    
+
     let random = Math.random() * totalWeight;
-    
+
     for (let i = 0; i < items.length; i++) {
       random -= weights[i];
       if (random <= 0) {
         return items[i];
       }
     }
-    
+
     // Fallback to last item if rounding errors occur
     return items[items.length - 1];
   }
@@ -2096,12 +2845,15 @@ async function fetchPerformerCount(performerFilter = {}) {
   // Swiss mode: fetch two performers with similar ratings
   async function fetchSwissPairPerformers() {
     if (selectedGenders.length === 0) {
-      throw new Error("No genders selected. Please select at least one gender in the filter.");
+      throw new Error(
+        "No genders selected. Please select at least one gender in the filter.",
+      );
     }
     // Pick a random gender for this battle to ensure same-gender matchups
-    const battleGender = selectedGenders[Math.floor(Math.random() * selectedGenders.length)];
+    const battleGender =
+      selectedGenders[Math.floor(Math.random() * selectedGenders.length)];
     const performerFilter = getPerformerFilterForGender(battleGender);
-    
+
     const performersQuery = `
       query FindPerformersByRating($performer_filter: PerformerFilterType, $filter: FindFilterType) {
         findPerformers(performer_filter: $performer_filter, filter: $filter) {
@@ -2118,34 +2870,42 @@ async function fetchPerformerCount(performerFilter = {}) {
       filter: {
         per_page: -1,
         sort: "rating",
-        direction: "DESC"
-      }
+        direction: "DESC",
+      },
     });
 
     const performers = result.findPerformers.performers || [];
-    
+
     if (performers.length < 2) {
       // Fallback to random if not enough rated performers
-      return { performers: await fetchRandomPerformers(2), ranks: [null, null] };
+      return {
+        performers: await fetchRandomPerformers(2),
+        ranks: [null, null],
+      };
     }
 
     // Calculate weights once and cache them with indices
     const performersWithWeights = performers.map((p, idx) => ({
       performer: p,
       weight: getRecencyWeight(p),
-      index: idx
+      index: idx,
     }));
-    
+
     // Pick a random performer, weighted by recency to avoid repetition
-    const weights = performersWithWeights.map(pw => pw.weight);
+    const weights = performersWithWeights.map((pw) => pw.weight);
     const selected1 = weightedRandomSelect(performersWithWeights, weights);
-    
+
     // Fallback to pure random if weighted selection fails
     if (!selected1) {
-      console.warn("[HotOrNot] Weighted selection failed, falling back to random");
-      return { performers: await fetchRandomPerformers(2), ranks: [null, null] };
+      console.warn(
+        "[HotOrNot] Weighted selection failed, falling back to random",
+      );
+      return {
+        performers: await fetchRandomPerformers(2),
+        ranks: [null, null],
+      };
     }
-    
+
     const performer1 = selected1.performer;
     const randomIndex = selected1.index;
     const rating1 = performer1.rating100 || 50;
@@ -2153,17 +2913,22 @@ async function fetchPerformerCount(performerFilter = {}) {
     // 10% "Sanity Check" - randomly pair regardless of rating
     // This helps detect performers stuck in incorrect rating silos
     // by occasionally testing them against performers from different rating tiers
-    const isRandomSanityCheck = Math.random() < 0.10;
-    
+    const isRandomSanityCheck = Math.random() < 0.1;
+
     if (isRandomSanityCheck) {
       // Pick any random performer (excluding performer1)
-      const otherPerformers = performersWithWeights.filter(pw => pw.performer.id !== performer1.id);
+      const otherPerformers = performersWithWeights.filter(
+        (pw) => pw.performer.id !== performer1.id,
+      );
       if (otherPerformers.length > 0) {
-        const randomOpponent = otherPerformers[Math.floor(Math.random() * otherPerformers.length)];
-        console.log('[HotOrNot] Sanity check pairing: random matchup regardless of rating');
-        return { 
-          performers: [performer1, randomOpponent.performer], 
-          ranks: [randomIndex + 1, randomOpponent.index + 1] 
+        const randomOpponent =
+          otherPerformers[Math.floor(Math.random() * otherPerformers.length)];
+        console.log(
+          "[HotOrNot] Sanity check pairing: random matchup regardless of rating",
+        );
+        return {
+          performers: [performer1, randomOpponent.performer],
+          ranks: [randomIndex + 1, randomOpponent.index + 1],
         };
       }
     }
@@ -2175,26 +2940,34 @@ async function fetchPerformerCount(performerFilter = {}) {
     const stats1 = parsePerformerEloData(performer1);
     const streak1 = stats1.current_streak || 0;
     let targetRating = rating1;
-    
+
     if (Math.abs(streak1) >= STREAK_THRESHOLD_MODERATE) {
       // Streak bonus/penalty: up to ±10 rating points based on streak magnitude
       const maxStreakAdjustment = 10;
-      const streakAdjustment = Math.min(Math.abs(streak1) * STREAK_RATING_MULTIPLIER, maxStreakAdjustment);
+      const streakAdjustment = Math.min(
+        Math.abs(streak1) * STREAK_RATING_MULTIPLIER,
+        maxStreakAdjustment,
+      );
       if (streak1 > 0) {
         // Hot streak: look for slightly tougher opponents
         targetRating = rating1 + streakAdjustment;
-        console.log(`[HotOrNot] Hot streak (${streak1}): targeting opponents near rating ${targetRating} (+${streakAdjustment})`);
+        console.log(
+          `[HotOrNot] Hot streak (${streak1}): targeting opponents near rating ${targetRating} (+${streakAdjustment})`,
+        );
       } else {
         // Cold streak: look for slightly easier opponents
         targetRating = rating1 - streakAdjustment;
-        console.log(`[HotOrNot] Cold streak (${streak1}): targeting opponents near rating ${targetRating} (-${streakAdjustment})`);
+        console.log(
+          `[HotOrNot] Cold streak (${streak1}): targeting opponents near rating ${targetRating} (-${streakAdjustment})`,
+        );
       }
     }
 
     // Find performers within adaptive rating window (tighter for larger pools)
     // Window is centered on targetRating (which may be streak-adjusted)
-    const matchWindow = performers.length > 50 ? 10 : performers.length > 20 ? 15 : 25;
-    const similarPerformersWithWeights = performersWithWeights.filter(pw => {
+    const matchWindow =
+      performers.length > 50 ? 10 : performers.length > 20 ? 15 : 25;
+    const similarPerformersWithWeights = performersWithWeights.filter((pw) => {
       if (pw.performer.id === performer1.id) return false;
       const rating = pw.performer.rating100 || 50;
       return Math.abs(rating - targetRating) <= matchWindow;
@@ -2204,13 +2977,23 @@ async function fetchPerformerCount(performerFilter = {}) {
     let performer2Index;
     if (similarPerformersWithWeights.length > 0) {
       // Pick from similar-rated performers, using cached weights
-      const similarWeights = similarPerformersWithWeights.map(pw => pw.weight);
-      const selected2 = weightedRandomSelect(similarPerformersWithWeights, similarWeights);
-      
+      const similarWeights = similarPerformersWithWeights.map(
+        (pw) => pw.weight,
+      );
+      const selected2 = weightedRandomSelect(
+        similarPerformersWithWeights,
+        similarWeights,
+      );
+
       // Fallback to pure random if weighted selection fails
       if (!selected2) {
-        console.warn("[HotOrNot] Weighted selection for performer2 failed, falling back to random");
-        const randomSimilar = similarPerformersWithWeights[Math.floor(Math.random() * similarPerformersWithWeights.length)];
+        console.warn(
+          "[HotOrNot] Weighted selection for performer2 failed, falling back to random",
+        );
+        const randomSimilar =
+          similarPerformersWithWeights[
+            Math.floor(Math.random() * similarPerformersWithWeights.length)
+          ];
         performer2 = randomSimilar.performer;
         performer2Index = randomSimilar.index;
       } else {
@@ -2219,47 +3002,57 @@ async function fetchPerformerCount(performerFilter = {}) {
       }
     } else {
       // No similar performers within window, pick closest to targetRating with recency weighting
-      const otherPerformersWithWeights = performersWithWeights.filter(pw => pw.performer.id !== performer1.id);
-      
+      const otherPerformersWithWeights = performersWithWeights.filter(
+        (pw) => pw.performer.id !== performer1.id,
+      );
+
       // Sort by rating similarity to targetRating (which may be streak-adjusted)
       otherPerformersWithWeights.sort((a, b) => {
         const diffA = Math.abs((a.performer.rating100 || 50) - targetRating);
         const diffB = Math.abs((b.performer.rating100 || 50) - targetRating);
         return diffA - diffB;
       });
-      
+
       // Apply weighted selection to the top 3 closest performers (if available)
       const closestCount = Math.min(3, otherPerformersWithWeights.length);
-      const closestPerformers = otherPerformersWithWeights.slice(0, closestCount);
-      const closestWeights = closestPerformers.map(pw => pw.weight);
+      const closestPerformers = otherPerformersWithWeights.slice(
+        0,
+        closestCount,
+      );
+      const closestWeights = closestPerformers.map((pw) => pw.weight);
       const selected2 = weightedRandomSelect(closestPerformers, closestWeights);
-      
+
       if (selected2) {
         performer2 = selected2.performer;
         performer2Index = selected2.index;
       } else {
         // Ultimate fallback - just pick the closest
-        console.warn("[HotOrNot] Weighted selection for closest performer failed, using rating-based fallback");
+        console.warn(
+          "[HotOrNot] Weighted selection for closest performer failed, using rating-based fallback",
+        );
         performer2 = otherPerformersWithWeights[0].performer;
         performer2Index = otherPerformersWithWeights[0].index;
       }
     }
 
-    return { 
-      performers: [performer1, performer2], 
-      ranks: [randomIndex + 1, performer2Index + 1] 
+    return {
+      performers: [performer1, performer2],
+      ranks: [randomIndex + 1, performer2Index + 1],
     };
   }
 
   // Gauntlet mode: champion vs next challenger
   async function fetchGauntletPairPerformers() {
     if (selectedGenders.length === 0) {
-      throw new Error("No genders selected. Please select at least one gender in the filter.");
+      throw new Error(
+        "No genders selected. Please select at least one gender in the filter.",
+      );
     }
     // Lock to the champion's gender for the entire gauntlet run; pick a random gender if no champion yet
-    const battleGender = (gauntletChampion && gauntletChampion.gender)
-      ? gauntletChampion.gender
-      : selectedGenders[Math.floor(Math.random() * selectedGenders.length)];
+    const battleGender =
+      gauntletChampion && gauntletChampion.gender
+        ? gauntletChampion.gender
+        : selectedGenders[Math.floor(Math.random() * selectedGenders.length)];
     const performerFilter = getPerformerFilterForGender(battleGender);
     const performersQuery = `
       query FindPerformersByRating($performer_filter: PerformerFilterType, $filter: FindFilterType) {
@@ -2278,21 +3071,28 @@ async function fetchPerformerCount(performerFilter = {}) {
       filter: {
         per_page: -1, // Get all
         sort: "rating",
-        direction: "DESC"
-      }
+        direction: "DESC",
+      },
     });
 
     const performers = result.findPerformers.performers || [];
     totalItemsCount = performers.length;
-    
+
     if (performers.length < 2) {
-      return { performers: await fetchRandomPerformers(2), ranks: [null, null], isVictory: false, isFalling: false };
+      return {
+        performers: await fetchRandomPerformers(2),
+        ranks: [null, null],
+        isVictory: false,
+        isFalling: false,
+      };
     }
 
     // Handle falling mode - find next opponent BELOW to test against
     if (gauntletFalling && gauntletFallingItem) {
-      const fallingIndex = performers.findIndex(s => s.id === gauntletFallingItem.id);
-      
+      const fallingIndex = performers.findIndex(
+        (s) => s.id === gauntletFallingItem.id,
+      );
+
       // Find opponents below (higher index) that haven't been tested
       const belowOpponents = performers.filter((s, idx) => {
         if (s.id === gauntletFallingItem.id) return false;
@@ -2300,17 +3100,20 @@ async function fetchPerformerCount(performerFilter = {}) {
         if (gauntletFallingTested.includes(s.id)) return false; // Skip opponents already tested during falling
         return idx > fallingIndex; // Below in ranking
       });
-      
+
       if (belowOpponents.length === 0) {
         // No more undefeated opponents below - found their floor!
         // Simply place them at their current position
         const currentRating = gauntletFallingItem.rating100 || 50;
-        
+
         // Calculate rank based on current rating
-        const finalRank = performers.filter(p => 
-          p.id !== gauntletFallingItem.id && (p.rating100 || 50) > currentRating
-        ).length + 1;
-        
+        const finalRank =
+          performers.filter(
+            (p) =>
+              p.id !== gauntletFallingItem.id &&
+              (p.rating100 || 50) > currentRating,
+          ).length + 1;
+
         return {
           performers: [gauntletFallingItem],
           ranks: [finalRank],
@@ -2318,21 +3121,23 @@ async function fetchPerformerCount(performerFilter = {}) {
           isFalling: true,
           isPlacement: true,
           placementRank: finalRank,
-          placementRating: currentRating
+          placementRating: currentRating,
         };
       } else {
         // Get next opponent below (first one, closest to falling performer)
         const nextBelow = belowOpponents[0];
-        const nextBelowIndex = performers.findIndex(s => s.id === nextBelow.id);
-        
+        const nextBelowIndex = performers.findIndex(
+          (s) => s.id === nextBelow.id,
+        );
+
         // Update the falling performer's rank for display
         gauntletChampionRank = fallingIndex + 1;
-        
+
         return {
           performers: [gauntletFallingItem, nextBelow],
           ranks: [fallingIndex + 1, nextBelowIndex + 1],
           isVictory: false,
-          isFalling: true
+          isFalling: true,
         };
       }
     }
@@ -2344,96 +3149,101 @@ async function fetchPerformerCount(performerFilter = {}) {
       gauntletFalling = false;
       gauntletFallingItem = null;
       gauntletFallingTested = [];
-      
+
       // Pick random performer as challenger
       const randomIndex = Math.floor(Math.random() * performers.length);
       const challenger = performers[randomIndex];
-      
+
       // Start at the bottom - find lowest rated performer that isn't the challenger
       const lowestRated = performers
-        .filter(s => s.id !== challenger.id)
+        .filter((s) => s.id !== challenger.id)
         .sort((a, b) => (a.rating100 || 0) - (b.rating100 || 0))[0];
-      
-      const lowestIndex = performers.findIndex(s => s.id === lowestRated.id);
-      
+
+      const lowestIndex = performers.findIndex((s) => s.id === lowestRated.id);
+
       // Challenger's current rank
       gauntletChampionRank = randomIndex + 1;
-      
-      return { 
-        performers: [challenger, lowestRated], 
+
+      return {
+        performers: [challenger, lowestRated],
         ranks: [randomIndex + 1, lowestIndex + 1],
         isVictory: false,
-        isFalling: false
+        isFalling: false,
       };
     }
 
     // Champion exists - find next opponent they haven't defeated yet
-    const championIndex = performers.findIndex(s => s.id === gauntletChampion.id);
-    
+    const championIndex = performers.findIndex(
+      (s) => s.id === gauntletChampion.id,
+    );
+
     // Update champion rank (1-indexed, so +1)
     gauntletChampionRank = championIndex + 1;
-    
+
     // Create an index map for O(1) lookups (performance optimization)
     const performerIndexMap = new Map(performers.map((p, idx) => [p.id, idx]));
-    
+
     // Find ALL undefeated opponents (anyone the champion hasn't beaten yet)
     const allUndefeatedOpponents = performers.filter((s) => {
       if (s.id === gauntletChampion.id) return false;
       if (gauntletDefeated.includes(s.id)) return false;
       return true;
     });
-    
+
     // Victory is only when ALL performers have been defeated
     if (allUndefeatedOpponents.length === 0) {
       gauntletChampionRank = 1;
-      return { 
-        performers: [gauntletChampion], 
+      return {
+        performers: [gauntletChampion],
         ranks: [1],
         isVictory: true,
-        isFalling: false
+        isFalling: false,
       };
     }
-    
+
     // From undefeated opponents, only fight those ranked higher (lower index = higher rating)
     // Once the champion has defeated all higher-ranked opponents, they've reached the top
     const higherRankedOpponents = allUndefeatedOpponents.filter((s) => {
       const opponentIndex = performerIndexMap.get(s.id);
       return opponentIndex < championIndex;
     });
-    
+
     // Victory when there are no more higher-ranked opponents to defeat
     // The champion has proven themselves against all performers above them
     if (higherRankedOpponents.length === 0) {
       gauntletChampionRank = 1;
-      return { 
-        performers: [gauntletChampion], 
+      return {
+        performers: [gauntletChampion],
         ranks: [1],
         isVictory: true,
-        isFalling: false
+        isFalling: false,
       };
     }
-    
+
     // Pick from higher ranked opponents
     const nextOpponent = selectRandomOpponent(higherRankedOpponents);
     const nextOpponentIndex = performerIndexMap.get(nextOpponent.id);
-    
-    return { 
-      performers: [gauntletChampion, nextOpponent], 
+
+    return {
+      performers: [gauntletChampion, nextOpponent],
       ranks: [championIndex + 1, nextOpponentIndex + 1],
       isVictory: false,
-      isFalling: false
+      isFalling: false,
     };
   }
 
   // Champion mode: like gauntlet but winner stays on (no falling)
   async function fetchChampionPairPerformers() {
     if (selectedGenders.length === 0) {
-      throw new Error("No genders selected. Please select at least one gender in the filter.");
+      throw new Error(
+        "No genders selected. Please select at least one gender in the filter.",
+      );
     }
     // Lock to the champion's gender for the entire run; pick a random gender if no champion yet
-    const battleGender = (gauntletChampion && gauntletChampion.gender)
-      ? gauntletChampion.gender
-      : selectedGenders[Math.floor(Math.random() * selectedGenders.length)];
+    const battleGender =
+      gauntletChampion && gauntletChampion.gender
+        ? gauntletChampion.gender
+        : selectedGenders[Math.floor(Math.random() * selectedGenders.length)];
     const performerFilter = getPerformerFilterForGender(battleGender);
     const performersQuery = `
       query FindPerformersByRating($performer_filter: PerformerFilterType, $filter: FindFilterType) {
@@ -2452,92 +3262,98 @@ async function fetchPerformerCount(performerFilter = {}) {
       filter: {
         per_page: -1,
         sort: "rating",
-        direction: "DESC"
-      }
+        direction: "DESC",
+      },
     });
 
     const performers = result.findPerformers.performers || [];
     totalItemsCount = performers.length;
-    
+
     if (performers.length < 2) {
-      return { performers: await fetchRandomPerformers(2), ranks: [null, null], isVictory: false };
+      return {
+        performers: await fetchRandomPerformers(2),
+        ranks: [null, null],
+        isVictory: false,
+      };
     }
 
     // If no champion yet, start with a random challenger vs the lowest rated performer
     if (!gauntletChampion) {
       gauntletDefeated = [];
-      
+
       // Pick random performer as challenger
       const randomIndex = Math.floor(Math.random() * performers.length);
       const challenger = performers[randomIndex];
-      
+
       // Start at the bottom - find lowest rated performer that isn't the challenger
       const lowestRated = performers
-        .filter(s => s.id !== challenger.id)
+        .filter((s) => s.id !== challenger.id)
         .sort((a, b) => (a.rating100 || 0) - (b.rating100 || 0))[0];
-      
-      const lowestIndex = performers.findIndex(s => s.id === lowestRated.id);
-      
+
+      const lowestIndex = performers.findIndex((s) => s.id === lowestRated.id);
+
       gauntletChampionRank = randomIndex + 1;
-      
-      return { 
-        performers: [challenger, lowestRated], 
+
+      return {
+        performers: [challenger, lowestRated],
         ranks: [randomIndex + 1, lowestIndex + 1],
-        isVictory: false
+        isVictory: false,
       };
     }
 
     // Champion exists - find next opponent they haven't defeated yet
-    const championIndex = performers.findIndex(s => s.id === gauntletChampion.id);
-    
+    const championIndex = performers.findIndex(
+      (s) => s.id === gauntletChampion.id,
+    );
+
     gauntletChampionRank = championIndex + 1;
-    
+
     // Create an index map for O(1) lookups (performance optimization)
     const performerIndexMap = new Map(performers.map((p, idx) => [p.id, idx]));
-    
+
     // Find ALL undefeated opponents (anyone the champion hasn't beaten yet)
     const allUndefeatedOpponents = performers.filter((s) => {
       if (s.id === gauntletChampion.id) return false;
       if (gauntletDefeated.includes(s.id)) return false;
       return true;
     });
-    
+
     // Victory is only when ALL performers have been defeated
     if (allUndefeatedOpponents.length === 0) {
       gauntletChampionRank = 1;
-      return { 
-        performers: [gauntletChampion], 
+      return {
+        performers: [gauntletChampion],
         ranks: [1],
-        isVictory: true
+        isVictory: true,
       };
     }
-    
+
     // From undefeated opponents, only fight those ranked higher (lower index = higher rating)
     // Once the champion has defeated all higher-ranked opponents, they've reached the top
     const higherRankedOpponents = allUndefeatedOpponents.filter((s) => {
       const opponentIndex = performerIndexMap.get(s.id);
       return opponentIndex < championIndex;
     });
-    
+
     // Victory when there are no more higher-ranked opponents to defeat
     // The champion has proven themselves against all performers above them
     if (higherRankedOpponents.length === 0) {
       gauntletChampionRank = 1;
-      return { 
-        performers: [gauntletChampion], 
+      return {
+        performers: [gauntletChampion],
         ranks: [1],
-        isVictory: true
+        isVictory: true,
       };
     }
-    
+
     // Pick from higher ranked opponents
     const nextOpponent = selectRandomOpponent(higherRankedOpponents);
     const nextOpponentIndex = performerIndexMap.get(nextOpponent.id);
-    
-    return { 
-      performers: [gauntletChampion, nextOpponent], 
+
+    return {
+      performers: [gauntletChampion, nextOpponent],
       ranks: [championIndex + 1, nextOpponentIndex + 1],
-      isVictory: false
+      isVictory: false,
     };
   }
 
@@ -2560,7 +3376,9 @@ async function fetchPerformerCount(performerFilter = {}) {
   async function fetchRandomImages(count = 2) {
     const totalImages = await fetchImageCount();
     if (totalImages < 2) {
-      throw new Error("Not enough images for comparison. You need at least 2 images.");
+      throw new Error(
+        "Not enough images for comparison. You need at least 2 images.",
+      );
     }
 
     const imagesQuery = `
@@ -2576,12 +3394,12 @@ async function fetchPerformerCount(performerFilter = {}) {
     const result = await graphqlQuery(imagesQuery, {
       filter: {
         per_page: Math.min(100, totalImages),
-        sort: "random"
-      }
+        sort: "random",
+      },
     });
 
     const allImages = result.findImages.images || [];
-    
+
     if (allImages.length < 2) {
       throw new Error("Not enough images returned from query.");
     }
@@ -2597,7 +3415,7 @@ async function fetchPerformerCount(performerFilter = {}) {
     const totalImages = await fetchImageCount();
     const useSampling = totalImages > 1000;
     const sampleSize = useSampling ? Math.min(500, totalImages) : totalImages;
-    
+
     const imagesQuery = `
       query FindImagesByRating($filter: FindFilterType) {
         findImages(filter: $filter) {
@@ -2613,12 +3431,12 @@ async function fetchPerformerCount(performerFilter = {}) {
       filter: {
         per_page: sampleSize,
         sort: useSampling ? "random" : "rating",
-        direction: useSampling ? undefined : "DESC"
-      }
+        direction: useSampling ? undefined : "DESC",
+      },
     });
 
     const images = result.findImages.images || [];
-    
+
     if (images.length < 2) {
       // Fallback to random if not enough rated images
       return { images: await fetchRandomImages(2), ranks: [null, null] };
@@ -2631,7 +3449,7 @@ async function fetchPerformerCount(performerFilter = {}) {
 
     // Find images within adaptive rating window (tighter for larger pools)
     const matchWindow = images.length > 50 ? 10 : images.length > 20 ? 15 : 25;
-    const similarImages = images.filter(s => {
+    const similarImages = images.filter((s) => {
       if (s.id === image1.id) return false;
       const rating = s.rating100 || 50;
       return Math.abs(rating - rating1) <= matchWindow;
@@ -2642,29 +3460,29 @@ async function fetchPerformerCount(performerFilter = {}) {
     if (similarImages.length > 0) {
       // Pick random from similar-rated images
       image2 = similarImages[Math.floor(Math.random() * similarImages.length)];
-      image2Index = images.findIndex(s => s.id === image2.id);
+      image2Index = images.findIndex((s) => s.id === image2.id);
     } else {
       // No similar images, pick closest
-      const otherImages = images.filter(s => s.id !== image1.id);
+      const otherImages = images.filter((s) => s.id !== image1.id);
       otherImages.sort((a, b) => {
         const diffA = Math.abs((a.rating100 || 50) - rating1);
         const diffB = Math.abs((b.rating100 || 50) - rating1);
         return diffA - diffB;
       });
       image2 = otherImages[0];
-      image2Index = images.findIndex(s => s.id === image2.id);
+      image2Index = images.findIndex((s) => s.id === image2.id);
     }
 
-    return { 
-      images: [image1, image2], 
+    return {
+      images: [image1, image2],
       // When using sampling, ranks are not meaningful (don't represent true position)
-      ranks: useSampling ? [null, null] : [randomIndex + 1, image2Index + 1] 
+      ranks: useSampling ? [null, null] : [randomIndex + 1, image2Index + 1],
     };
   }
 
   // NOTE: Gauntlet and Champion modes for images have been removed.
   // Images now use Swiss mode exclusively for optimal performance.
-  // The functions fetchGauntletPairImages() and fetchChampionPairImages() 
+  // The functions fetchGauntletPairImages() and fetchChampionPairImages()
   // have been removed as they are no longer needed.
 
   async function updateImageRating(imageId, newRating) {
@@ -2676,13 +3494,13 @@ async function fetchPerformerCount(performerFilter = {}) {
         }
       }
     `;
-    
+
     try {
       await graphqlQuery(mutation, {
         input: {
           id: imageId,
-          rating100: Math.max(1, Math.min(100, Math.round(newRating)))
-        }
+          rating100: Math.max(1, Math.min(100, Math.round(newRating))),
+        },
       });
       console.log(`[HotOrNot] Updated image ${imageId} rating to ${newRating}`);
     } catch (e) {
@@ -2707,7 +3525,9 @@ async function fetchPerformerCount(performerFilter = {}) {
       return await fetchGauntletPairPerformers();
     } else {
       // Images use Swiss mode only - this should never be called
-      console.error("[HotOrNot] ERROR: Gauntlet mode called for images (not supported). Using Swiss mode as fallback.");
+      console.error(
+        "[HotOrNot] ERROR: Gauntlet mode called for images (not supported). Using Swiss mode as fallback.",
+      );
       return await fetchSwissPairImages();
     }
   }
@@ -2717,12 +3537,19 @@ async function fetchPerformerCount(performerFilter = {}) {
       return await fetchChampionPairPerformers();
     } else {
       // Images use Swiss mode only - this should never be called
-      console.error("[HotOrNot] ERROR: Champion mode called for images (not supported). Using Swiss mode as fallback.");
+      console.error(
+        "[HotOrNot] ERROR: Champion mode called for images (not supported). Using Swiss mode as fallback.",
+      );
       return await fetchSwissPairImages();
     }
   }
 
-  async function updateItemRating(itemId, newRating, itemObj = null, won = null) {
+  async function updateItemRating(
+    itemId,
+    newRating,
+    itemObj = null,
+    won = null,
+  ) {
     if (battleType === "performers") {
       return await updatePerformerRating(itemId, newRating, itemObj, won);
     } else {
@@ -2733,28 +3560,40 @@ async function fetchPerformerCount(performerFilter = {}) {
   // UI COMPONENTS
   // ============================================
 
-  function createPerformerCard(performer, side, rank = null, streak = null) {
+  function createPerformerCard(
+    performer,
+    side,
+    rank = null,
+    streak = null,
+    compact = false,
+    extraImages = null,
+  ) {
     // Performer name
     const name = performer.name || `Performer #${performer.id}`;
-    
+
     // Performer image - use their profile image
     const imagePath = performer.image_path || null;
-    
+
     // Performer metadata
     const birthdate = performer.birthdate || null;
     const ethnicity = performer.ethnicity || null;
     const country = performer.country || null;
     const sceneCount = performer.scene_count || 0;
-    const stashRating = performer.rating100 ? `${performer.rating100}/100` : "Unrated";
-    
+    const stashRating = performer.rating100
+      ? `${performer.rating100}/100`
+      : "Unrated";
+
     // Parse stats for enhanced display
     const stats = parsePerformerEloData(performer);
     const confidence = getConfidenceLevel(stats);
     const rating = performer.rating100 || 50;
-    const ratingInterval = getRatingConfidenceInterval(rating, stats.total_matches);
-    
+    const ratingInterval = getRatingConfidenceInterval(
+      rating,
+      stats.total_matches,
+    );
+
     // Build confidence and stats display
-    let statsDisplay = '';
+    let statsDisplay = "";
     if (stats.total_matches > 0) {
       const winRate = ((stats.wins / stats.total_matches) * 100).toFixed(0);
       const streakIcon = getStreakIcon(stats.current_streak);
@@ -2775,36 +3614,75 @@ async function fetchPerformerCount(performerFilter = {}) {
         </div>
       `;
     }
-    
+
     // Enhanced rating display with confidence interval if enough matches
     let enhancedRating = stashRating;
     if (stats.total_matches >= 5 && performer.rating100) {
       enhancedRating = `${rating} (${ratingInterval.low}-${ratingInterval.high})`;
     }
-    
+
     // Handle numeric ranks and string ranks
-    let rankDisplay = '';
+    let rankDisplay = "";
     if (rank !== null && rank !== undefined) {
-      if (typeof rank === 'number') {
+      if (typeof rank === "number") {
         rankDisplay = `<span class="hon-performer-rank hon-scene-rank">#${rank}</span>`;
       } else {
         rankDisplay = `<span class="hon-performer-rank hon-scene-rank">${rank}</span>`;
       }
     }
-    
+
     // Streak badge for gauntlet champion
-    let streakBadgeDisplay = '';
+    let streakBadgeDisplay = "";
     if (streak !== null && streak > 0) {
-      streakBadgeDisplay = `<div class="hon-streak-badge">🔥 ${streak} win${streak > 1 ? 's' : ''}</div>`;
+      streakBadgeDisplay = `<div class="hon-streak-badge">🔥 ${streak} win${streak > 1 ? "s" : ""}</div>`;
+    }
+
+    // Build image section: plain or gallery depending on extraImages
+    const mainImgHtml = imagePath
+      ? `<img class="hon-performer-image hon-scene-image" src="${imagePath}" alt="${name}" loading="lazy" />`
+      : `<div class="hon-performer-image hon-scene-image hon-no-image">No Image</div>`;
+
+    const hasGallery =
+      extraImages &&
+      extraImages.thumbnails &&
+      extraImages.thumbnails.length > 0;
+    const galleryClass = hasGallery ? " hon-has-extra-images" : "";
+    const imageInnerHtml = hasGallery
+      ? `
+        <div class="hon-image-gallery-main">${mainImgHtml}</div>
+        ${buildGalleryExtrasHtml(extraImages, performer.id)}`
+      : mainImgHtml;
+
+    if (compact) {
+      const countryInline = country
+        ? `<span class="hon-compact-country">${getCountryDisplay(country)}</span>`
+        : "";
+      return `
+        <div class="hon-performer-card hon-scene-card hon-compact" data-performer-id="${performer.id}" data-side="${side}" data-rating="${performer.rating100 || 50}">
+          <div class="hon-performer-image-container hon-scene-image-container${galleryClass}" data-performer-url="/performers/${performer.id}" data-winner="${performer.id}">
+            ${imageInnerHtml}
+            ${streakBadgeDisplay}
+            <div class="hon-click-hint">Click to choose</div>
+          </div>
+
+          <div class="hon-performer-body hon-scene-body hon-compact-body" data-winner="${performer.id}">
+            <div class="hon-performer-info hon-scene-info">
+              <div class="hon-performer-title-row hon-scene-title-row hon-compact-title-row">
+                <h3 class="hon-performer-title hon-scene-title">${name}</h3>
+                ${countryInline}
+                ${rankDisplay}
+              </div>
+            </div>
+            <a class="hon-compact-profile-link" href="/performers/${performer.id}" target="_blank" rel="noopener" onclick="event.stopPropagation();">View Profile ↗</a>
+          </div>
+        </div>
+      `;
     }
 
     return `
       <div class="hon-performer-card hon-scene-card" data-performer-id="${performer.id}" data-side="${side}" data-rating="${performer.rating100 || 50}">
-        <div class="hon-performer-image-container hon-scene-image-container" data-performer-url="/performers/${performer.id}">
-          ${imagePath 
-            ? `<img class="hon-performer-image hon-scene-image" src="${imagePath}" alt="${name}" loading="lazy" />`
-            : `<div class="hon-performer-image hon-scene-image hon-no-image">No Image</div>`
-          }
+        <div class="hon-performer-image-container hon-scene-image-container${galleryClass}" data-performer-url="/performers/${performer.id}">
+          ${imageInnerHtml}
           ${streakBadgeDisplay}
           <div class="hon-click-hint">Click to open performer</div>
         </div>
@@ -2817,10 +3695,10 @@ async function fetchPerformerCount(performerFilter = {}) {
             </div>
             
             <div class="hon-performer-meta hon-scene-meta">
-              ${birthdate ? `<div class="hon-meta-item"><strong>Birthdate:</strong> ${birthdate}</div>` : ''}
-              ${ethnicity ? `<div class="hon-meta-item"><strong>Ethnicity:</strong> ${ethnicity}</div>` : ''}
-              ${country ? `<div class="hon-meta-item"><strong>Country:</strong> ${getCountryDisplay(country)}</div>` : ''}
-              ${performer.gender ? `<div class="hon-meta-item"><strong>Gender:</strong> ${getGenderDisplay(performer.gender)}</div>` : ''}
+              ${birthdate ? `<div class="hon-meta-item"><strong>Birthdate:</strong> ${birthdate}</div>` : ""}
+              ${ethnicity ? `<div class="hon-meta-item"><strong>Ethnicity:</strong> ${ethnicity}</div>` : ""}
+              ${country ? `<div class="hon-meta-item"><strong>Country:</strong> ${getCountryDisplay(country)}</div>` : ""}
+              ${performer.gender ? `<div class="hon-meta-item"><strong>Gender:</strong> ${getGenderDisplay(performer.gender)}</div>` : ""}
               <div class="hon-meta-item"><strong>Scenes:</strong> ${sceneCount}</div>
               <div class="hon-meta-item"><strong>Rating:</strong> ${enhancedRating}</div>
               ${statsDisplay}
@@ -2837,34 +3715,37 @@ async function fetchPerformerCount(performerFilter = {}) {
 
   function createImageCard(image, side, rank = null, streak = null) {
     // Image paths
-    const imagePath = image.paths && image.paths.image ? image.paths.image : null;
-    const thumbnailPath = image.paths && image.paths.thumbnail ? image.paths.thumbnail : null;
-    
+    const imagePath =
+      image.paths && image.paths.image ? image.paths.image : null;
+    const thumbnailPath =
+      image.paths && image.paths.thumbnail ? image.paths.thumbnail : null;
+
     // Handle numeric ranks and string ranks
-    let rankDisplay = '';
+    let rankDisplay = "";
     if (rank !== null && rank !== undefined) {
-      if (typeof rank === 'number') {
+      if (typeof rank === "number") {
         rankDisplay = `<span class="hon-image-rank hon-scene-rank">#${rank}</span>`;
       } else {
         rankDisplay = `<span class="hon-image-rank hon-scene-rank">${rank}</span>`;
       }
     }
-    
+
     // Streak badge for gauntlet champion
-    let streakDisplay = '';
+    let streakDisplay = "";
     if (streak !== null && streak > 0) {
-      streakDisplay = `<div class="hon-streak-badge">🔥 ${streak} win${streak > 1 ? 's' : ''}</div>`;
+      streakDisplay = `<div class="hon-streak-badge">🔥 ${streak} win${streak > 1 ? "s" : ""}</div>`;
     }
 
     return `
       <div class="hon-image-card hon-scene-card" data-image-id="${image.id}" data-side="${side}" data-rating="${image.rating100 || 50}">
         <div class="hon-image-image-container hon-scene-image-container" data-image-url="/images/${image.id}">
-          ${thumbnailPath 
-            ? `<img class="hon-image-image hon-scene-image" src="${thumbnailPath}" alt="Image #${image.id}" loading="lazy" />`
-            : `<div class="hon-image-image hon-scene-image hon-no-image">No Image</div>`
+          ${
+            thumbnailPath
+              ? `<img class="hon-image-image hon-scene-image" src="${thumbnailPath}" alt="Image #${image.id}" loading="lazy" />`
+              : `<div class="hon-image-image hon-scene-image hon-no-image">No Image</div>`
           }
           ${streakDisplay}
-          ${rankDisplay ? `<div class="hon-image-rank-overlay">${rankDisplay}</div>` : ''}
+          ${rankDisplay ? `<div class="hon-image-rank-overlay">${rankDisplay}</div>` : ""}
           <div class="hon-click-hint">Click to open image</div>
         </div>
         
@@ -2884,7 +3765,7 @@ async function fetchPerformerCount(performerFilter = {}) {
   async function fetchPerformersForSelection(count = 5) {
     const performerFilter = getPerformerFilter();
     const totalPerformers = await fetchPerformerCount(performerFilter);
-    
+
     if (totalPerformers < count) {
       count = totalPerformers;
     }
@@ -2903,8 +3784,8 @@ async function fetchPerformerCount(performerFilter = {}) {
       performer_filter: performerFilter,
       filter: {
         per_page: Math.min(100, totalPerformers),
-        sort: "random"
-      }
+        sort: "random",
+      },
     });
 
     const allPerformers = result.findPerformers.performers || [];
@@ -2915,14 +3796,17 @@ async function fetchPerformerCount(performerFilter = {}) {
   function createPerformerSelectionCard(performer) {
     const name = performer.name || `Performer #${performer.id}`;
     const imagePath = performer.image_path || null;
-    const rating = performer.rating100 ? `${performer.rating100}/100` : "Unrated";
-    
+    const rating = performer.rating100
+      ? `${performer.rating100}/100`
+      : "Unrated";
+
     return `
       <div class="hon-selection-card" data-performer-id="${performer.id}">
         <div class="hon-selection-image-container">
-          ${imagePath 
-            ? `<img class="hon-selection-image" src="${imagePath}" alt="${name}" loading="lazy" />`
-            : `<div class="hon-selection-image hon-no-image">No Image</div>`
+          ${
+            imagePath
+              ? `<img class="hon-selection-image" src="${imagePath}" alt="${name}" loading="lazy" />`
+              : `<div class="hon-selection-image hon-no-image">No Image</div>`
           }
         </div>
         <div class="hon-selection-info">
@@ -2934,26 +3818,33 @@ async function fetchPerformerCount(performerFilter = {}) {
   }
 
   async function loadPerformerSelection() {
-    const selectionContainer = document.getElementById("hon-performer-selection");
+    const selectionContainer = document.getElementById(
+      "hon-performer-selection",
+    );
     const performerList = document.getElementById("hon-performer-list");
-    
+
     if (!selectionContainer || !performerList) return;
 
     try {
       const performers = await fetchPerformersForSelection(5);
-      
+
       if (performers.length === 0) {
-        performerList.innerHTML = '<div class="hon-error">No performers available for selection.</div>';
+        performerList.innerHTML =
+          '<div class="hon-error">No performers available for selection.</div>';
         return;
       }
 
-      performerList.innerHTML = performers.map(p => createPerformerSelectionCard(p)).join('');
-      
+      performerList.innerHTML = performers
+        .map((p) => createPerformerSelectionCard(p))
+        .join("");
+
       // Attach click handlers
-      performerList.querySelectorAll('.hon-selection-card').forEach((card) => {
-        card.addEventListener('click', () => {
+      performerList.querySelectorAll(".hon-selection-card").forEach((card) => {
+        card.addEventListener("click", () => {
           const performerId = card.dataset.performerId;
-          const selectedPerformer = performers.find(p => p.id.toString() === performerId);
+          const selectedPerformer = performers.find(
+            (p) => p.id.toString() === performerId,
+          );
           if (selectedPerformer) {
             startGauntletWithPerformer(selectedPerformer);
           }
@@ -2973,30 +3864,34 @@ async function fetchPerformerCount(performerFilter = {}) {
     gauntletFalling = false;
     gauntletFallingItem = null;
     gauntletFallingTested = [];
-    
+
     // Hide the selection UI
-    const selectionContainer = document.getElementById("hon-performer-selection");
+    const selectionContainer = document.getElementById(
+      "hon-performer-selection",
+    );
     if (selectionContainer) {
       selectionContainer.style.display = "none";
     }
-    
+
     // Show the comparison area and actions
     const comparisonArea = document.getElementById("hon-comparison-area");
     const actionsEl = document.querySelector(".hon-actions");
     if (comparisonArea) comparisonArea.style.display = "";
     if (actionsEl) actionsEl.style.display = "";
-    
+
     // Load the first matchup
     loadNewPair();
   }
 
   function showPerformerSelection() {
-    const selectionContainer = document.getElementById("hon-performer-selection");
+    const selectionContainer = document.getElementById(
+      "hon-performer-selection",
+    );
     if (selectionContainer) {
       selectionContainer.style.display = "block";
       loadPerformerSelection();
     }
-    
+
     // Hide the comparison area until a performer is selected
     const comparisonArea = document.getElementById("hon-comparison-area");
     const actionsEl = document.querySelector(".hon-actions");
@@ -3005,11 +3900,13 @@ async function fetchPerformerCount(performerFilter = {}) {
   }
 
   function hidePerformerSelection() {
-    const selectionContainer = document.getElementById("hon-performer-selection");
+    const selectionContainer = document.getElementById(
+      "hon-performer-selection",
+    );
     if (selectionContainer) {
       selectionContainer.style.display = "none";
     }
-    
+
     // Show the comparison area
     const comparisonArea = document.getElementById("hon-comparison-area");
     const actionsEl = document.querySelector(".hon-actions");
@@ -3034,13 +3931,13 @@ async function fetchPerformerCount(performerFilter = {}) {
    * @returns {string} HTML-safe string
    */
   function escapeHtml(unsafe) {
-    if (!unsafe) return '';
+    if (!unsafe) return "";
     return String(unsafe)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#039;');
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
   }
 
   /**
@@ -3063,8 +3960,8 @@ async function fetchPerformerCount(performerFilter = {}) {
       filter: {
         per_page: -1,
         sort: "rating",
-        direction: "DESC"
-      }
+        direction: "DESC",
+      },
     });
 
     return result.findPerformers.performers || [];
@@ -3086,64 +3983,80 @@ async function fetchPerformerCount(performerFilter = {}) {
         name: p.name || `Performer #${p.id}`,
         id: p.id,
         rating: ((p.rating100 || 50) / 10).toFixed(1),
-        ...stats
+        ...stats,
       };
     });
 
     // Calculate totals and averages
-    const totalMatches = performersWithStats.reduce((sum, p) => sum + p.total_matches, 0);
+    const totalMatches = performersWithStats.reduce(
+      (sum, p) => sum + p.total_matches,
+      0,
+    );
     const performerCount = performers.length;
-    const avgMatches = performerCount > 0 ? (totalMatches / performerCount).toFixed(1) : '0.0';
-    const avgRating = performerCount > 0 
-      ? ((performers.reduce((sum, p) => sum + (p.rating100 || 50), 0) / performerCount) / 10).toFixed(1) 
-      : '5.0';
+    const avgMatches =
+      performerCount > 0 ? (totalMatches / performerCount).toFixed(1) : "0.0";
+    const avgRating =
+      performerCount > 0
+        ? (
+            performers.reduce((sum, p) => sum + (p.rating100 || 50), 0) /
+            performerCount /
+            10
+          ).toFixed(1)
+        : "5.0";
 
     // Calculate rating distribution for bar graph (100 individual rating values: 0.1, 0.2, 0.3, ..., 10.0)
     // Create 100 buckets for granular distribution
     const ratingBuckets = Array(100).fill(0);
-    performersWithStats.forEach(p => {
+    performersWithStats.forEach((p) => {
       const ratingValue = parseFloat(p.rating); // Rating is 0.0-10.0
       // Map rating to bucket index (0-99)
       // Rating 0.1 goes into bucket 0 (displayed as 0.1)
       // Rating 10.0 goes into bucket 99 (displayed as 10.0)
       // Use Math.round to handle floating point precision, then subtract 1 to align with display labels
-      const bucketIndex = Math.max(0, Math.min(99, Math.round(ratingValue * 10) - 1));
+      const bucketIndex = Math.max(
+        0,
+        Math.min(99, Math.round(ratingValue * 10) - 1),
+      );
       ratingBuckets[bucketIndex]++;
     });
-    
+
     // Calculate group totals for the 10 rating ranges (0-1, 1-2, ..., 9-10)
     const groupTotals = [];
     for (let i = 0; i < 10; i++) {
       const groupBuckets = ratingBuckets.slice(i * 10, (i + 1) * 10);
       groupTotals.push(groupBuckets.reduce((sum, count) => sum + count, 0));
     }
-    
+
     // Use group totals for the header bar scaling (shows totals per 10s)
     const maxGroupTotal = Math.max(...groupTotals, 1);
     // Use individual bucket max for expanded view scaling
     const maxBucketCount = Math.max(...ratingBuckets, 1);
-    
+
     // Group buckets into 10 collapsible groups (0.1-1.0, 1.1-2.0, ..., 9.1-10.0)
     const barGraphGroups = [];
     for (let groupIndex = 0; groupIndex < 10; groupIndex++) {
       const startRating = (groupIndex * 10 + 1) / 10; // 0.1, 1.1, 2.1, ..., 9.1
       const endRating = groupIndex + 1; // 1, 2, 3, ..., 10
-      
+
       // Get buckets for this group (10 buckets per group)
-      const groupBuckets = ratingBuckets.slice(groupIndex * 10, (groupIndex + 1) * 10);
+      const groupBuckets = ratingBuckets.slice(
+        groupIndex * 10,
+        (groupIndex + 1) * 10,
+      );
       const groupTotal = groupTotals[groupIndex];
-      
+
       // Calculate percentage for the group header bar (scaled to max group total)
       const groupPercentage = (groupTotal / maxGroupTotal) * 100;
-      
+
       // Create individual bars for this group (scaled to max bucket count for detail view)
-      const barsInGroup = groupBuckets.map((count, bucketIndexInGroup) => {
-        const bucketIndex = groupIndex * 10 + bucketIndexInGroup;
-        const percentage = (count / maxBucketCount) * 100;
-        const rangeStart = ((bucketIndex + 1) / 10).toFixed(1);
-        const displayRange = `${rangeStart}`;
-        
-        return `
+      const barsInGroup = groupBuckets
+        .map((count, bucketIndexInGroup) => {
+          const bucketIndex = groupIndex * 10 + bucketIndexInGroup;
+          const percentage = (count / maxBucketCount) * 100;
+          const rangeStart = ((bucketIndex + 1) / 10).toFixed(1);
+          const displayRange = `${rangeStart}`;
+
+          return `
           <div class="hon-bar-container">
             <div class="hon-bar-label">${displayRange}</div>
             <div class="hon-bar-wrapper">
@@ -3153,8 +4066,9 @@ async function fetchPerformerCount(performerFilter = {}) {
             </div>
           </div>
         `;
-      }).join('');
-      
+        })
+        .join("");
+
       barGraphGroups.push(`
         <div class="hon-bar-group">
           <div class="hon-bar-group-header" data-group="bar-${groupIndex}" role="button" aria-expanded="false" aria-controls="bar-group-${groupIndex}" aria-label="Toggle ratings ${startRating.toFixed(1)} to ${endRating}.0 group">
@@ -3172,8 +4086,8 @@ async function fetchPerformerCount(performerFilter = {}) {
         </div>
       `);
     }
-    
-    const barGraphHTML = barGraphGroups.join('');
+
+    const barGraphHTML = barGraphGroups.join("");
 
     // Group performers by 250 (1-250, 251-500, etc.)
     const groupedPerformers = [];
@@ -3185,19 +4099,25 @@ async function fetchPerformerCount(performerFilter = {}) {
     }
 
     // Create grouped table sections with expand/collapse
-    const groupedTableHTML = groupedPerformers.map((group, groupIndex) => {
-      const groupRows = group.performers.map(p => {
-        const winRate = p.total_matches > 0 ? ((p.wins / p.total_matches) * 100).toFixed(1) : 'N/A';
-        const streakDisplay = p.current_streak > 0 
-          ? `<span class="hon-stats-positive">+${p.current_streak}</span>` 
-          : p.current_streak < 0 
-            ? `<span class="hon-stats-negative">${p.current_streak}</span>`
-            : '0';
-        
-        // Escape performer name to prevent XSS
-        const safeName = escapeHtml(p.name);
-        
-        return `
+    const groupedTableHTML = groupedPerformers
+      .map((group, groupIndex) => {
+        const groupRows = group.performers
+          .map((p) => {
+            const winRate =
+              p.total_matches > 0
+                ? ((p.wins / p.total_matches) * 100).toFixed(1)
+                : "N/A";
+            const streakDisplay =
+              p.current_streak > 0
+                ? `<span class="hon-stats-positive">+${p.current_streak}</span>`
+                : p.current_streak < 0
+                  ? `<span class="hon-stats-negative">${p.current_streak}</span>`
+                  : "0";
+
+            // Escape performer name to prevent XSS
+            const safeName = escapeHtml(p.name);
+
+            return `
           <tr>
             <td class="hon-stats-rank">#${p.rank}</td>
             <td class="hon-stats-name">
@@ -3208,15 +4128,16 @@ async function fetchPerformerCount(performerFilter = {}) {
             <td class="hon-stats-positive">${p.wins}</td>
             <td class="hon-stats-negative">${p.losses}</td>
             <td class="hon-stats-neutral">${p.draws || 0}</td>
-            <td>${winRate}${winRate !== 'N/A' ? '%' : ''}</td>
+            <td>${winRate}${winRate !== "N/A" ? "%" : ""}</td>
             <td>${streakDisplay}</td>
             <td class="hon-stats-positive">${p.best_streak}</td>
             <td class="hon-stats-negative">${p.worst_streak}</td>
           </tr>
         `;
-      }).join('');
+          })
+          .join("");
 
-      return `
+        return `
         <div class="hon-rank-group">
           <div class="hon-rank-group-header" data-group="${groupIndex}" role="button" aria-expanded="false" aria-controls="rank-group-${groupIndex}" aria-label="Toggle ranks ${group.startRank} to ${group.endRank} group">
             <span class="hon-group-toggle">▶</span>
@@ -3232,7 +4153,8 @@ async function fetchPerformerCount(performerFilter = {}) {
           </div>
         </div>
       `;
-    }).join('');
+      })
+      .join("");
 
     return `
       <div class="hon-stats-modal-content">
@@ -3324,12 +4246,16 @@ async function fetchPerformerCount(performerFilter = {}) {
     document.body.appendChild(statsModal);
 
     // Close handlers
-    statsModal.querySelector(".hon-modal-backdrop").addEventListener("click", () => {
-      statsModal.remove();
-    });
-    statsModal.querySelector(".hon-modal-close").addEventListener("click", () => {
-      statsModal.remove();
-    });
+    statsModal
+      .querySelector(".hon-modal-backdrop")
+      .addEventListener("click", () => {
+        statsModal.remove();
+      });
+    statsModal
+      .querySelector(".hon-modal-close")
+      .addEventListener("click", () => {
+        statsModal.remove();
+      });
 
     // Fetch and display stats
     try {
@@ -3349,17 +4275,17 @@ async function fetchPerformerCount(performerFilter = {}) {
       // Attach tab switching handlers
       const tabButtons = dialog.querySelectorAll(".hon-stats-tab");
       const tabPanels = dialog.querySelectorAll(".hon-stats-tab-panel");
-      
-      tabButtons.forEach(button => {
+
+      tabButtons.forEach((button) => {
         button.addEventListener("click", () => {
           const tabName = button.dataset.tab;
-          
+
           // Update active tab button
-          tabButtons.forEach(btn => btn.classList.remove("active"));
+          tabButtons.forEach((btn) => btn.classList.remove("active"));
           button.classList.add("active");
-          
+
           // Update active tab panel
-          tabPanels.forEach(panel => {
+          tabPanels.forEach((panel) => {
             if (panel.dataset.panel === tabName) {
               panel.classList.add("active");
             } else {
@@ -3372,12 +4298,14 @@ async function fetchPerformerCount(performerFilter = {}) {
       // Helper function to attach expand/collapse handlers to collapsible groups
       const attachCollapseHandlers = (headerSelector, contentSelector) => {
         const headers = dialog.querySelectorAll(headerSelector);
-        headers.forEach(header => {
+        headers.forEach((header) => {
           header.addEventListener("click", () => {
             const groupIndex = header.dataset.group;
-            const content = dialog.querySelector(`${contentSelector}[data-group="${groupIndex}"]`);
+            const content = dialog.querySelector(
+              `${contentSelector}[data-group="${groupIndex}"]`,
+            );
             const toggle = header.querySelector(".hon-group-toggle");
-            
+
             if (content && content.classList.contains("collapsed")) {
               content.classList.remove("collapsed");
               header.setAttribute("aria-expanded", "true");
@@ -3392,7 +4320,10 @@ async function fetchPerformerCount(performerFilter = {}) {
       };
 
       // Attach expand/collapse handlers for rank groups and bar graph groups
-      attachCollapseHandlers(".hon-rank-group-header", ".hon-rank-group-content");
+      attachCollapseHandlers(
+        ".hon-rank-group-header",
+        ".hon-rank-group-content",
+      );
       attachCollapseHandlers(".hon-bar-group-header", ".hon-bar-group-content");
     } catch (error) {
       console.error("[HotOrNot] Error loading stats:", error);
@@ -3401,7 +4332,7 @@ async function fetchPerformerCount(performerFilter = {}) {
         <button class="hon-modal-close">✕</button>
         <div class="hon-stats-error">Failed to load performer statistics. Please try again later.</div>
       `;
-      
+
       dialog.querySelector(".hon-modal-close").addEventListener("click", () => {
         statsModal.remove();
       });
@@ -3410,51 +4341,62 @@ async function fetchPerformerCount(performerFilter = {}) {
 
   function createMainUI() {
     const itemType = battleType === "performers" ? "performers" : "images";
-    const itemTypeSingular = battleType === "performers" ? "performer" : "image";
-    
+    const itemTypeSingular =
+      battleType === "performers" ? "performer" : "image";
+
     // For images, hide mode selection (only use Swiss mode)
     const showModeToggle = battleType !== "images";
-    const modeToggleHTML = showModeToggle ? `
+    const modeToggleHTML = showModeToggle
+      ? `
           <div class="hon-mode-toggle">
-            <button class="hon-mode-btn ${currentMode === 'swiss' ? 'active' : ''}" data-mode="swiss">
+            <button class="hon-mode-btn ${currentMode === "swiss" ? "active" : ""}" data-mode="swiss">
               <span class="hon-mode-icon">⚖️</span>
               <span class="hon-mode-title">Swiss</span>
               <span class="hon-mode-desc">Fair matchups</span>
             </button>
-            <button class="hon-mode-btn ${currentMode === 'gauntlet' ? 'active' : ''}" data-mode="gauntlet">
+            <button class="hon-mode-btn ${currentMode === "gauntlet" ? "active" : ""}" data-mode="gauntlet">
               <span class="hon-mode-icon">🎯</span>
               <span class="hon-mode-title">Gauntlet</span>
               <span class="hon-mode-desc">Place a ${itemTypeSingular}</span>
             </button>
-            <button class="hon-mode-btn ${currentMode === 'champion' ? 'active' : ''}" data-mode="champion">
+            <button class="hon-mode-btn ${currentMode === "champion" ? "active" : ""}" data-mode="champion">
               <span class="hon-mode-icon">🏆</span>
               <span class="hon-mode-title">Champion</span>
               <span class="hon-mode-desc">Winner stays on</span>
             </button>
           </div>
-    ` : '';
+    `
+      : "";
 
     // Gender filter (performers only)
-    const genderFilterHTML = battleType === "performers" ? `
+    const genderFilterHTML =
+      battleType === "performers"
+        ? `
           <div class="hon-gender-filter">
             <span class="hon-gender-filter-label">Genders:</span>
             <div class="hon-gender-btns">
-              ${ALL_GENDERS.map(g => `
-                <button class="hon-gender-btn ${selectedGenders.includes(g.value) ? 'active' : ''}" data-gender="${g.value}">
+              ${ALL_GENDERS.map(
+                (g) => `
+                <button class="hon-gender-btn ${selectedGenders.includes(g.value) ? "active" : ""}" data-gender="${g.value}">
                   ${g.label}
                 </button>
-              `).join('')}
+              `,
+              ).join("")}
             </div>
           </div>
-    ` : '';
-    
+    `
+        : "";
+
     // Stats button for performers
-    const statsButtonHTML = battleType === "performers" ? `
+    const statsButtonHTML =
+      battleType === "performers"
+        ? `
           <button id="hon-stats-btn" class="btn btn-primary hon-stats-button">
             📊 View All Stats
           </button>
-    ` : '';
-    
+    `
+        : "";
+
     return `
       <div id="hotornot-container" class="hon-container">
         <div class="hon-header">
@@ -3496,25 +4438,32 @@ async function fetchPerformerCount(performerFilter = {}) {
 
   async function loadNewPair() {
     disableChoice = false;
+    // Clear per-performer gallery pools so new performers get fresh pools
+    galleryImagePools.clear();
     const comparisonArea = document.getElementById("hon-comparison-area");
     if (!comparisonArea) return;
 
     // For gauntlet mode with performers, show selection if no champion yet
     // Images don't use gauntlet/champion modes
-    if (currentMode === "gauntlet" && battleType === "performers" && !gauntletChampion && !gauntletFalling) {
+    if (
+      currentMode === "gauntlet" &&
+      battleType === "performers" &&
+      !gauntletChampion &&
+      !gauntletFalling
+    ) {
       showPerformerSelection();
       return;
     }
 
     // Only show loading on first load (when empty or already showing loading)
-    if (!comparisonArea.querySelector('.hon-vs-container')) {
+    if (!comparisonArea.querySelector(".hon-vs-container")) {
       comparisonArea.innerHTML = '<div class="hon-loading">Loading...</div>';
     }
 
     try {
       let items;
       let ranks = [null, null];
-      
+
       // Images always use Swiss mode
       if (battleType === "images" || currentMode === "swiss") {
         const swissResult = await fetchSwissPair();
@@ -3522,19 +4471,22 @@ async function fetchPerformerCount(performerFilter = {}) {
         ranks = swissResult.ranks;
       } else if (currentMode === "gauntlet") {
         const gauntletResult = await fetchGauntletPair();
-        
+
         // Check for victory (champion reached #1)
         if (gauntletResult.isVictory) {
-          comparisonArea.innerHTML = createVictoryScreen((gauntletResult.performers || gauntletResult.images)[0]);
-          
+          comparisonArea.innerHTML = createVictoryScreen(
+            (gauntletResult.performers || gauntletResult.images)[0],
+          );
+
           // Hide the status banner and skip button
           const statusEl = document.getElementById("hon-gauntlet-status");
           const actionsEl = document.querySelector(".hon-actions");
           if (statusEl) statusEl.style.display = "none";
           if (actionsEl) actionsEl.style.display = "none";
-          
+
           // Attach new gauntlet button
-          const newGauntletBtn = comparisonArea.querySelector("#hon-new-gauntlet");
+          const newGauntletBtn =
+            comparisonArea.querySelector("#hon-new-gauntlet");
           if (newGauntletBtn) {
             newGauntletBtn.addEventListener("click", () => {
               gauntletChampion = null;
@@ -3549,31 +4501,38 @@ async function fetchPerformerCount(performerFilter = {}) {
               loadNewPair();
             });
           }
-          
+
           return;
         }
-        
+
         // Check for placement (falling item hit bottom)
         if (gauntletResult.isPlacement) {
-          showPlacementScreen((gauntletResult.performers || gauntletResult.images)[0], gauntletResult.placementRank, gauntletResult.placementRating);
+          showPlacementScreen(
+            (gauntletResult.performers || gauntletResult.images)[0],
+            gauntletResult.placementRank,
+            gauntletResult.placementRating,
+          );
           return;
         }
-        
+
         items = gauntletResult.performers || gauntletResult.images;
         ranks = gauntletResult.ranks;
       } else if (currentMode === "champion") {
         const championResult = await fetchChampionPair();
-        
+
         // Check for victory (champion beat everyone)
         if (championResult.isVictory) {
-          comparisonArea.innerHTML = createVictoryScreen((championResult.performers || championResult.images)[0]);
-          
+          comparisonArea.innerHTML = createVictoryScreen(
+            (championResult.performers || championResult.images)[0],
+          );
+
           // Hide the skip button
           const actionsEl = document.querySelector(".hon-actions");
           if (actionsEl) actionsEl.style.display = "none";
-          
+
           // Attach new run button
-          const newGauntletBtn = comparisonArea.querySelector("#hon-new-gauntlet");
+          const newGauntletBtn =
+            comparisonArea.querySelector("#hon-new-gauntlet");
           if (newGauntletBtn) {
             newGauntletBtn.addEventListener("click", () => {
               gauntletChampion = null;
@@ -3584,18 +4543,17 @@ async function fetchPerformerCount(performerFilter = {}) {
               loadNewPair();
             });
           }
-          
+
           return;
         }
-        
+
         items = championResult.performers || championResult.images;
         ranks = championResult.ranks;
       }
-      
+
       if (items.length < 2) {
         const itemType = battleType === "performers" ? "performers" : "images";
-        comparisonArea.innerHTML =
-          `<div class="hon-error">Not enough ${itemType} available for comparison.</div>`;
+        comparisonArea.innerHTML = `<div class="hon-error">Not enough ${itemType} available for comparison.</div>`;
         return;
       }
 
@@ -3615,54 +4573,106 @@ async function fetchPerformerCount(performerFilter = {}) {
         }
       }
 
+      const config = await getHotOrNotConfig();
+      const compactCard =
+        battleType === "performers" && config.compactCard === true;
+      const showExtraImages =
+        battleType === "performers" && config.displayExtraImages === true;
+
+      let leftExtraImages = null;
+      let rightExtraImages = null;
+      if (showExtraImages) {
+        [leftExtraImages, rightExtraImages] = await Promise.all([
+          fetchPerformerExtraImages(items[0].id),
+          fetchPerformerExtraImages(items[1].id),
+        ]);
+      }
+
       comparisonArea.innerHTML = `
         <div class="hon-vs-container">
-          ${(battleType === "performers" ? createPerformerCard : createImageCard)(items[0], "left", ranks[0], leftStreak)}
+          ${
+            battleType === "performers"
+              ? createPerformerCard(
+                  items[0],
+                  "left",
+                  ranks[0],
+                  leftStreak,
+                  compactCard,
+                  leftExtraImages,
+                )
+              : createImageCard(items[0], "left", ranks[0], leftStreak)
+          }
           <div class="hon-vs-divider">
             <span class="hon-vs-text">VS</span>
           </div>
-          ${(battleType === "performers" ? createPerformerCard : createImageCard)(items[1], "right", ranks[1], rightStreak)}
+          ${
+            battleType === "performers"
+              ? createPerformerCard(
+                  items[1],
+                  "right",
+                  ranks[1],
+                  rightStreak,
+                  compactCard,
+                  rightExtraImages,
+                )
+              : createImageCard(items[1], "right", ranks[1], rightStreak)
+          }
         </div>
       `;
 
       // Attach event listeners to scene body (for choosing)
+      // In compact mode the body still needs a listener so keyboard arrow shortcuts work,
+      // even though the primary click target is the image container.
       comparisonArea.querySelectorAll(".hon-scene-body").forEach((body) => {
         body.addEventListener("click", handleChooseItem);
       });
 
-      // Attach click-to-open (for thumbnail only)
-      comparisonArea.querySelectorAll(".hon-scene-image-container").forEach((container) => {
-        const itemUrl = container.dataset.performerUrl || container.dataset.imageUrl;
-        
-        container.addEventListener("click", () => {
-          if (itemUrl) {
-            window.open(itemUrl, "_blank");
+      // Attach gallery refresh buttons
+      attachGalleryRefreshHandlers(comparisonArea);
+      comparisonArea
+        .querySelectorAll(".hon-scene-image-container")
+        .forEach((container) => {
+          if (compactCard && container.dataset.winner) {
+            // Compact mode: clicking the image chooses the performer
+            container.addEventListener("click", (e) => {
+              handleChooseItem({ currentTarget: container });
+            });
+          } else {
+            const itemUrl =
+              container.dataset.performerUrl || container.dataset.imageUrl;
+            container.addEventListener("click", () => {
+              if (itemUrl) {
+                window.open(itemUrl, "_blank");
+              }
+            });
           }
         });
-      });
 
       // Attach hover preview to entire card
       comparisonArea.querySelectorAll(".hon-scene-card").forEach((card) => {
         const video = card.querySelector(".hon-hover-preview");
         if (!video) return;
-        
+
         card.addEventListener("mouseenter", () => {
           video.currentTime = 0;
           video.muted = false;
           video.volume = 0.5;
           video.play().catch(() => {});
         });
-        
+
         card.addEventListener("mouseleave", () => {
           video.pause();
           video.currentTime = 0;
         });
       });
-      
+
       // Update skip button state (only disabled for performers in gauntlet/champion mode)
       const skipBtn = document.querySelector("#hon-skip-btn");
       if (skipBtn) {
-        const disableSkip = battleType === "performers" && (currentMode === "gauntlet" || currentMode === "champion") && gauntletChampion;
+        const disableSkip =
+          battleType === "performers" &&
+          (currentMode === "gauntlet" || currentMode === "champion") &&
+          gauntletChampion;
         skipBtn.disabled = disableSkip;
         skipBtn.style.opacity = disableSkip ? "0.5" : "1";
         skipBtn.style.cursor = disableSkip ? "not-allowed" : "pointer";
@@ -3700,11 +4710,15 @@ async function fetchPerformerCount(performerFilter = {}) {
       right: structuredClone(currentPair.right),
       ranks: { left: currentRanks.left, right: currentRanks.right },
       mode: currentMode,
-      gauntletChampion: gauntletChampion ? structuredClone(gauntletChampion) : null,
+      gauntletChampion: gauntletChampion
+        ? structuredClone(gauntletChampion)
+        : null,
       gauntletWins: gauntletWins,
       gauntletDefeated: [...gauntletDefeated],
       gauntletFalling: gauntletFalling,
-      gauntletFallingItem: gauntletFallingItem ? structuredClone(gauntletFallingItem) : null,
+      gauntletFallingItem: gauntletFallingItem
+        ? structuredClone(gauntletFallingItem)
+        : null,
       gauntletFallingTested: [...gauntletFallingTested],
     };
   }
@@ -3732,14 +4746,15 @@ async function fetchPerformerCount(performerFilter = {}) {
       }
     `;
 
-    const fields = oldStats !== null && oldStats !== undefined
-      ? { hotornot_stats: oldStats }
-      : {};
+    const fields =
+      oldStats !== null && oldStats !== undefined
+        ? { hotornot_stats: oldStats }
+        : {};
 
     return await graphqlQuery(mutation, {
       id: performerId,
       rating: Math.round(oldRating),
-      fields
+      fields,
     });
   }
 
@@ -3761,18 +4776,30 @@ async function fetchPerformerCount(performerFilter = {}) {
 
     try {
       if (battleType === "performers") {
-        const leftStats = undo.left.custom_fields && undo.left.custom_fields.hotornot_stats
-          ? undo.left.custom_fields.hotornot_stats : null;
-        const rightStats = undo.right.custom_fields && undo.right.custom_fields.hotornot_stats
-          ? undo.right.custom_fields.hotornot_stats : null;
+        const leftStats =
+          undo.left.custom_fields && undo.left.custom_fields.hotornot_stats
+            ? undo.left.custom_fields.hotornot_stats
+            : null;
+        const rightStats =
+          undo.right.custom_fields && undo.right.custom_fields.hotornot_stats
+            ? undo.right.custom_fields.hotornot_stats
+            : null;
         await Promise.all([
-          restorePerformerState(undo.left.id, undo.left.rating100 || 50, leftStats),
-          restorePerformerState(undo.right.id, undo.right.rating100 || 50, rightStats)
+          restorePerformerState(
+            undo.left.id,
+            undo.left.rating100 || 50,
+            leftStats,
+          ),
+          restorePerformerState(
+            undo.right.id,
+            undo.right.rating100 || 50,
+            rightStats,
+          ),
         ]);
       } else if (battleType === "images") {
         await Promise.all([
           updateImageRating(undo.left.id, undo.left.rating100 || 50),
-          updateImageRating(undo.right.id, undo.right.rating100 || 50)
+          updateImageRating(undo.right.id, undo.right.rating100 || 50),
         ]);
       }
 
@@ -3799,31 +4826,94 @@ async function fetchPerformerCount(performerFilter = {}) {
         if (currentMode === "gauntlet" || currentMode === "champion") {
           if (gauntletChampion && undo.left.id === gauntletChampion.id) {
             leftStreak = gauntletWins;
-          } else if (gauntletChampion && undo.right.id === gauntletChampion.id) {
+          } else if (
+            gauntletChampion &&
+            undo.right.id === gauntletChampion.id
+          ) {
             rightStreak = gauntletWins;
           }
         }
 
+        const undoConfig = await getHotOrNotConfig();
+        const compactCard =
+          battleType === "performers" && undoConfig.compactCard === true;
+        const showExtraImages =
+          battleType === "performers" && undoConfig.displayExtraImages === true;
+
+        let leftExtraImages = null;
+        let rightExtraImages = null;
+        if (showExtraImages) {
+          [leftExtraImages, rightExtraImages] = await Promise.all([
+            fetchPerformerExtraImages(undo.left.id),
+            fetchPerformerExtraImages(undo.right.id),
+          ]);
+        }
+
         comparisonArea.innerHTML = `
           <div class="hon-vs-container">
-            ${(battleType === "performers" ? createPerformerCard : createImageCard)(undo.left, "left", undo.ranks.left, leftStreak)}
+            ${
+              battleType === "performers"
+                ? createPerformerCard(
+                    undo.left,
+                    "left",
+                    undo.ranks.left,
+                    leftStreak,
+                    compactCard,
+                    leftExtraImages,
+                  )
+                : createImageCard(
+                    undo.left,
+                    "left",
+                    undo.ranks.left,
+                    leftStreak,
+                  )
+            }
             <div class="hon-vs-divider">
               <span class="hon-vs-text">VS</span>
             </div>
-            ${(battleType === "performers" ? createPerformerCard : createImageCard)(undo.right, "right", undo.ranks.right, rightStreak)}
+            ${
+              battleType === "performers"
+                ? createPerformerCard(
+                    undo.right,
+                    "right",
+                    undo.ranks.right,
+                    rightStreak,
+                    compactCard,
+                    rightExtraImages,
+                  )
+                : createImageCard(
+                    undo.right,
+                    "right",
+                    undo.ranks.right,
+                    rightStreak,
+                  )
+            }
           </div>
         `;
 
+        // Attach event listeners to scene body (for choosing / keyboard shortcuts)
         comparisonArea.querySelectorAll(".hon-scene-body").forEach((body) => {
           body.addEventListener("click", handleChooseItem);
         });
 
-        comparisonArea.querySelectorAll(".hon-scene-image-container").forEach((container) => {
-          const itemUrl = container.dataset.performerUrl || container.dataset.imageUrl;
-          container.addEventListener("click", () => {
-            if (itemUrl) window.open(itemUrl, "_blank");
+        // Attach gallery refresh buttons
+        attachGalleryRefreshHandlers(comparisonArea);
+
+        comparisonArea
+          .querySelectorAll(".hon-scene-image-container")
+          .forEach((container) => {
+            if (compactCard && container.dataset.winner) {
+              container.addEventListener("click", (e) => {
+                handleChooseItem({ currentTarget: container });
+              });
+            } else {
+              const itemUrl =
+                container.dataset.performerUrl || container.dataset.imageUrl;
+              container.addEventListener("click", () => {
+                if (itemUrl) window.open(itemUrl, "_blank");
+              });
+            }
           });
-        });
       }
 
       // Update mode toggle button states
@@ -3855,38 +4945,65 @@ async function fetchPerformerCount(performerFilter = {}) {
   }
 
   async function handleChooseItem(event) {
-    if(disableChoice) return;
+    if (disableChoice) return;
     disableChoice = true;
     // Save state BEFORE processing so the user can undo if they made a mistake
     saveBattleState();
     const body = event.currentTarget;
     const winnerId = body.dataset.winner;
     const winnerCard = body.closest(".hon-scene-card");
-    const loserId = winnerId === currentPair.left.id ? currentPair.right.id : currentPair.left.id;
-    
+    const loserId =
+      winnerId === currentPair.left.id
+        ? currentPair.right.id
+        : currentPair.left.id;
+
     const winnerRating = parseInt(winnerCard.dataset.rating) || 50;
-    const loserCard = document.querySelector(`.hon-scene-card[data-performer-id="${loserId}"], .hon-scene-card[data-image-id="${loserId}"]`);
+    const loserCard = document.querySelector(
+      `.hon-scene-card[data-performer-id="${loserId}"], .hon-scene-card[data-image-id="${loserId}"]`,
+    );
     const loserRating = parseInt(loserCard?.dataset.rating) || 50;
-    
+
     // Get the loser's rank for #1 dethrone logic
-    const loserRank = loserId === currentPair.left.id ? currentRanks.left : currentRanks.right;
+    const loserRank =
+      loserId === currentPair.left.id ? currentRanks.left : currentRanks.right;
 
     // Images always use Swiss mode logic (no gauntlet/champion)
     if (battleType === "images") {
-      const winnerItem = winnerId === currentPair.left.id ? currentPair.left : currentPair.right;
-      const loserItem = loserId === currentPair.left.id ? currentPair.left : currentPair.right;
-      const { newWinnerRating, newLoserRating, winnerChange, loserChange } = await handleComparison(
-        winnerId, loserId, winnerRating, loserRating, null, winnerItem, loserItem
-      );
+      const winnerItem =
+        winnerId === currentPair.left.id ? currentPair.left : currentPair.right;
+      const loserItem =
+        loserId === currentPair.left.id ? currentPair.left : currentPair.right;
+      const { newWinnerRating, newLoserRating, winnerChange, loserChange } =
+        await handleComparison(
+          winnerId,
+          loserId,
+          winnerRating,
+          loserRating,
+          null,
+          winnerItem,
+          loserItem,
+        );
 
       // Visual feedback
       winnerCard.classList.add("hon-winner");
       if (loserCard) loserCard.classList.add("hon-loser");
 
       // Show rating change animation
-      showRatingAnimation(winnerCard, winnerRating, newWinnerRating, winnerChange, true);
+      showRatingAnimation(
+        winnerCard,
+        winnerRating,
+        newWinnerRating,
+        winnerChange,
+        true,
+      );
       if (loserCard) {
-        showRatingAnimation(loserCard, loserRating, newLoserRating, loserChange, false);
+        showRatingAnimation(
+          loserCard,
+          loserRating,
+          newLoserRating,
+          loserChange,
+          false,
+        );
       }
 
       // Load new pair after animation
@@ -3898,9 +5015,11 @@ async function fetchPerformerCount(performerFilter = {}) {
 
     // Handle gauntlet mode (champion tracking) - only for performers
     if (currentMode === "gauntlet") {
-      const winnerItem = winnerId === currentPair.left.id ? currentPair.left : currentPair.right;
-      const loserItem = loserId === currentPair.left.id ? currentPair.left : currentPair.right;
-      
+      const winnerItem =
+        winnerId === currentPair.left.id ? currentPair.left : currentPair.right;
+      const loserItem =
+        loserId === currentPair.left.id ? currentPair.left : currentPair.right;
+
       // Check if we're in falling mode (finding floor after a loss)
       if (gauntletFalling && gauntletFallingItem) {
         if (winnerId === gauntletFallingItem.id) {
@@ -3908,16 +5027,23 @@ async function fetchPerformerCount(performerFilter = {}) {
           // Place them just above the person they beat, but also:
           //   - no lower than the floor from already-beaten opponents
           //   - no higher than the champion who knocked them down
-          
+
           // Raw placement: just above the loser they beat
           const rawFinalRating = Math.min(100, loserRating + 1);
           // Apply floor (can't drop below already-beaten performers)
-          const ratingFloor = await calculateDefeatedOpponentsFloor(gauntletDefeated);
+          const ratingFloor =
+            await calculateDefeatedOpponentsFloor(gauntletDefeated);
           // Apply ceiling (must stay below the champion who beat them)
-          const championRating = gauntletChampion ? (gauntletChampion.rating100 ?? null) : null;
-          const winnerCeiling = championRating !== null ? Math.max(1, championRating - 1) : 100;
-          const finalRating = Math.min(winnerCeiling, Math.max(rawFinalRating, ratingFloor));
-          
+          const championRating = gauntletChampion
+            ? (gauntletChampion.rating100 ?? null)
+            : null;
+          const winnerCeiling =
+            championRating !== null ? Math.max(1, championRating - 1) : 100;
+          const finalRating = Math.min(
+            winnerCeiling,
+            Math.max(rawFinalRating, ratingFloor),
+          );
+
           // Fetch all performers to calculate rank for display
           const performerFilter = getPerformerFilter();
           const performersQuery = `
@@ -3930,43 +5056,52 @@ async function fetchPerformerCount(performerFilter = {}) {
               }
             }
           `;
-          
+
           const performersResult = await graphqlQuery(performersQuery, {
             performer_filter: performerFilter,
-            filter: { per_page: -1, sort: "rating", direction: "DESC" }
+            filter: { per_page: -1, sort: "rating", direction: "DESC" },
           });
-          
-          const allPerformers = performersResult.findPerformers.performers || [];
-          
+
+          const allPerformers =
+            performersResult.findPerformers.performers || [];
+
           // Fetch latest performer data to get current stats before updating (parallel fetch for performance)
           let freshFallingPerformer = gauntletFallingItem;
           let freshLoserPerformer = loserItem;
-          
+
           if (battleType === "performers") {
             const [fetchedFalling, fetchedLoser] = await Promise.all([
               fetchPerformerById(gauntletFallingItem.id),
-              fetchPerformerById(loserId)
+              fetchPerformerById(loserId),
             ]);
             freshFallingPerformer = fetchedFalling || gauntletFallingItem;
             freshLoserPerformer = fetchedLoser || loserItem;
           }
-          
+
           // Track this as a win for the falling performer
-          updateItemRating(gauntletFallingItem.id, finalRating, freshFallingPerformer, true);
-          
+          updateItemRating(
+            gauntletFallingItem.id,
+            finalRating,
+            freshFallingPerformer,
+            true,
+          );
+
           // Track participation for the loser (defender)
           updateItemRating(loserId, loserRating, freshLoserPerformer, null);
-          
+
           // Calculate final rank based on the final rating
           // Count performers with ratings higher than finalRating
-          const finalRank = allPerformers.filter(p => 
-            p.id !== gauntletFallingItem.id && (p.rating100 || 50) > finalRating
-          ).length + 1;
-          
+          const finalRank =
+            allPerformers.filter(
+              (p) =>
+                p.id !== gauntletFallingItem.id &&
+                (p.rating100 || 50) > finalRating,
+            ).length + 1;
+
           // Visual feedback
           winnerCard.classList.add("hon-winner");
           if (loserCard) loserCard.classList.add("hon-loser");
-          
+
           // Show placement screen after brief delay
           setTimeout(() => {
             showPlacementScreen(gauntletFallingItem, finalRank, finalRating);
@@ -3976,71 +5111,99 @@ async function fetchPerformerCount(performerFilter = {}) {
           // Falling item lost again - keep falling
           // Track this opponent to avoid matching against them again during falling
           gauntletFallingTested.push(winnerId);
-          
+
           // Use ELO-based calculation for the rating loss instead of direct assignment
           // This ensures the performer doesn't drop too dramatically from a single loss
           const currentFallingRating = gauntletFallingItem.rating100 || 50;
           // Pass null for performer objects to prevent handleComparison from tracking stats internally
           // Stats are manually tracked below via updateItemRating calls to properly handle the floor calculation
           const { newLoserRating, loserChange } = await handleComparison(
-            winnerId, gauntletFallingItem.id, winnerRating, currentFallingRating,
-            null, /* loserRank - not needed for falling phase */
-            null, /* winnerObj - skip stats tracking */
-            null  /* loserObj - skip stats tracking */
+            winnerId,
+            gauntletFallingItem.id,
+            winnerRating,
+            currentFallingRating,
+            null /* loserRank - not needed for falling phase */,
+            null /* winnerObj - skip stats tracking */,
+            null /* loserObj - skip stats tracking */,
           );
-          
+
           // Calculate floor based on defeated opponents - can't drop below the highest-rated defeated performer
-          const ratingFloor = await calculateDefeatedOpponentsFloor(gauntletDefeated);
-          
+          const ratingFloor =
+            await calculateDefeatedOpponentsFloor(gauntletDefeated);
+
           // Apply floor but cap below the champion - falling performer must stay below whoever knocked them down
-          const championRating = gauntletChampion ? (gauntletChampion.rating100 ?? null) : null;
-          const winnerCeiling = championRating !== null ? Math.max(1, championRating - 1) : 100;
-          const newFallingRating = Math.min(winnerCeiling, Math.max(ratingFloor, newLoserRating));
-          
+          const championRating = gauntletChampion
+            ? (gauntletChampion.rating100 ?? null)
+            : null;
+          const winnerCeiling =
+            championRating !== null ? Math.max(1, championRating - 1) : 100;
+          const newFallingRating = Math.min(
+            winnerCeiling,
+            Math.max(ratingFloor, newLoserRating),
+          );
+
           // Fetch latest performer data to get current stats before updating (parallel fetch for performance)
           let freshFallingPerformer = gauntletFallingItem;
           let freshWinnerPerformer = winnerItem;
-          
+
           if (battleType === "performers") {
             const [fetchedFalling, fetchedWinner] = await Promise.all([
               fetchPerformerById(gauntletFallingItem.id),
-              fetchPerformerById(winnerId)
+              fetchPerformerById(winnerId),
             ]);
             freshFallingPerformer = fetchedFalling || gauntletFallingItem;
             freshWinnerPerformer = fetchedWinner || winnerItem;
           }
-          
+
           // Track stats for both participants
           // Track loss for the falling performer with their new (lower) rating
-          updateItemRating(gauntletFallingItem.id, newFallingRating, freshFallingPerformer, false);
-          
+          updateItemRating(
+            gauntletFallingItem.id,
+            newFallingRating,
+            freshFallingPerformer,
+            false,
+          );
+
           // Update the local object to reflect the new rating
           gauntletFallingItem.rating100 = newFallingRating;
-          
+
           // Track participation for the winner (defender)
           updateItemRating(winnerId, winnerRating, freshWinnerPerformer, null);
-          
+
           // Visual feedback
           winnerCard.classList.add("hon-winner");
           if (loserCard) loserCard.classList.add("hon-loser");
-          
+
           // Show rating animation for the falling performer
           if (loserCard) {
-            showRatingAnimation(loserCard, currentFallingRating, newFallingRating, loserChange, false);
+            showRatingAnimation(
+              loserCard,
+              currentFallingRating,
+              newFallingRating,
+              loserChange,
+              false,
+            );
           }
-          
+
           setTimeout(() => {
             loadNewPair();
           }, 1500);
           return;
         }
       }
-      
+
       // Normal climbing - calculate rating changes (pass loserRank for #1 dethrone)
-      const { newWinnerRating, newLoserRating, winnerChange, loserChange } = await handleComparison(
-        winnerId, loserId, winnerRating, loserRating, loserRank, winnerItem, loserItem
-      );
-      
+      const { newWinnerRating, newLoserRating, winnerChange, loserChange } =
+        await handleComparison(
+          winnerId,
+          loserId,
+          winnerRating,
+          loserRating,
+          loserRank,
+          winnerItem,
+          loserItem,
+        );
+
       if (gauntletChampion && winnerId === gauntletChampion.id) {
         // Champion won - add loser to defeated list and continue climbing
         gauntletDefeated.push(loserId);
@@ -4051,28 +5214,35 @@ async function fetchPerformerCount(performerFilter = {}) {
         gauntletFalling = true;
         gauntletFallingItem = loserItem; // The old champion is now falling
         gauntletFallingTested = []; // Reset tested list for new falling phase
-        
+
         // Calculate floor based on defeated opponents - can't drop below the highest-rated defeated performer
-        const ratingFloor = await calculateDefeatedOpponentsFloor(gauntletDefeated);
-        
+        const ratingFloor =
+          await calculateDefeatedOpponentsFloor(gauntletDefeated);
+
         // Apply floor but cap below the winner - loser must rank below whoever beat them
         const winnerCeiling = Math.max(1, newWinnerRating - 1);
-        const adjustedLoserRating = Math.min(winnerCeiling, Math.max(ratingFloor, newLoserRating));
-        
+        const adjustedLoserRating = Math.min(
+          winnerCeiling,
+          Math.max(ratingFloor, newLoserRating),
+        );
+
         // Update the falling item's rating with floor and ceiling applied
         gauntletFallingItem.rating100 = adjustedLoserRating;
-        
+
         // If adjusted rating differs from ELO-calculated rating,
         // update the database to reflect the adjusted rating.
         // Note: handleComparison already tracked stats for this loss,
         // so we pass null for performerObj to only update the rating without touching stats.
-        if (adjustedLoserRating !== newLoserRating && battleType === "performers") {
+        if (
+          adjustedLoserRating !== newLoserRating &&
+          battleType === "performers"
+        ) {
           await updateItemRating(loserId, adjustedLoserRating, null, null);
         }
         // Preserve the list of opponents already defeated during the climb
         // Note: Don't add the winner to gauntletDefeated - they beat us fair and square
         // gauntletDefeated is only for performers we actually defeated
-        
+
         // Winner becomes the new climbing champion
         gauntletChampion = winnerItem;
         gauntletChampion.rating100 = newWinnerRating;
@@ -4084,19 +5254,33 @@ async function fetchPerformerCount(performerFilter = {}) {
         gauntletDefeated = [loserId];
         gauntletWins = 1;
       }
-      
+
       // Visual feedback with animations
       winnerCard.classList.add("hon-winner");
       if (loserCard) loserCard.classList.add("hon-loser");
-      
-      showRatingAnimation(winnerCard, winnerRating, newWinnerRating, winnerChange, true);
+
+      showRatingAnimation(
+        winnerCard,
+        winnerRating,
+        newWinnerRating,
+        winnerChange,
+        true,
+      );
       if (loserCard) {
         // Use the falling item's actual new rating (which may have floor applied) for the animation
-        const actualLoserRating = gauntletFallingItem ? gauntletFallingItem.rating100 : newLoserRating;
+        const actualLoserRating = gauntletFallingItem
+          ? gauntletFallingItem.rating100
+          : newLoserRating;
         const actualLoserChange = actualLoserRating - loserRating;
-        showRatingAnimation(loserCard, loserRating, actualLoserRating, actualLoserChange, false);
+        showRatingAnimation(
+          loserCard,
+          loserRating,
+          actualLoserRating,
+          actualLoserChange,
+          false,
+        );
       }
-      
+
       // Load new pair after animation
       setTimeout(() => {
         loadNewPair();
@@ -4106,14 +5290,23 @@ async function fetchPerformerCount(performerFilter = {}) {
 
     // Handle champion mode (like gauntlet but winner always takes over)
     if (currentMode === "champion") {
-      const winnerItem = winnerId === currentPair.left.id ? currentPair.left : currentPair.right;
-      const loserItem = loserId === currentPair.left.id ? currentPair.left : currentPair.right;
-      
+      const winnerItem =
+        winnerId === currentPair.left.id ? currentPair.left : currentPair.right;
+      const loserItem =
+        loserId === currentPair.left.id ? currentPair.left : currentPair.right;
+
       // Calculate rating changes (pass loserRank for #1 dethrone)
-      const { newWinnerRating, newLoserRating, winnerChange, loserChange } = await handleComparison(
-        winnerId, loserId, winnerRating, loserRating, loserRank, winnerItem, loserItem
-      );
-      
+      const { newWinnerRating, newLoserRating, winnerChange, loserChange } =
+        await handleComparison(
+          winnerId,
+          loserId,
+          winnerRating,
+          loserRating,
+          loserRank,
+          winnerItem,
+          loserItem,
+        );
+
       if (gauntletChampion && winnerId === gauntletChampion.id) {
         // Champion won - continue climbing
         gauntletDefeated.push(loserId);
@@ -4126,16 +5319,28 @@ async function fetchPerformerCount(performerFilter = {}) {
         gauntletDefeated = [loserId];
         gauntletWins = 1;
       }
-      
+
       // Visual feedback with animations
       winnerCard.classList.add("hon-winner");
       if (loserCard) loserCard.classList.add("hon-loser");
-      
-      showRatingAnimation(winnerCard, winnerRating, newWinnerRating, winnerChange, true);
+
+      showRatingAnimation(
+        winnerCard,
+        winnerRating,
+        newWinnerRating,
+        winnerChange,
+        true,
+      );
       if (loserCard) {
-        showRatingAnimation(loserCard, loserRating, newLoserRating, loserChange, false);
+        showRatingAnimation(
+          loserCard,
+          loserRating,
+          newLoserRating,
+          loserChange,
+          false,
+        );
       }
-      
+
       // Load new pair after animation
       setTimeout(() => {
         loadNewPair();
@@ -4144,20 +5349,41 @@ async function fetchPerformerCount(performerFilter = {}) {
     }
 
     // For Swiss mode (performers only, images are handled above): Calculate and show rating changes
-    const winnerItem = winnerId === currentPair.left.id ? currentPair.left : currentPair.right;
-    const loserItem = loserId === currentPair.left.id ? currentPair.left : currentPair.right;
-    const { newWinnerRating, newLoserRating, winnerChange, loserChange } = await handleComparison(
-      winnerId, loserId, winnerRating, loserRating, null, winnerItem, loserItem
-    );
+    const winnerItem =
+      winnerId === currentPair.left.id ? currentPair.left : currentPair.right;
+    const loserItem =
+      loserId === currentPair.left.id ? currentPair.left : currentPair.right;
+    const { newWinnerRating, newLoserRating, winnerChange, loserChange } =
+      await handleComparison(
+        winnerId,
+        loserId,
+        winnerRating,
+        loserRating,
+        null,
+        winnerItem,
+        loserItem,
+      );
 
     // Visual feedback
     winnerCard.classList.add("hon-winner");
     if (loserCard) loserCard.classList.add("hon-loser");
 
     // Show rating change animation
-    showRatingAnimation(winnerCard, winnerRating, newWinnerRating, winnerChange, true);
+    showRatingAnimation(
+      winnerCard,
+      winnerRating,
+      newWinnerRating,
+      winnerChange,
+      true,
+    );
     if (loserCard) {
-      showRatingAnimation(loserCard, loserRating, newLoserRating, loserChange, false);
+      showRatingAnimation(
+        loserCard,
+        loserRating,
+        newLoserRating,
+        loserChange,
+        false,
+      );
     }
 
     // Load new pair after animation
@@ -4169,16 +5395,16 @@ async function fetchPerformerCount(performerFilter = {}) {
   function showRatingAnimation(card, oldRating, newRating, change, isWinner) {
     // Create overlay
     const overlay = document.createElement("div");
-    overlay.className = `hon-rating-overlay ${isWinner ? 'hon-rating-winner' : 'hon-rating-loser'}`;
-    
+    overlay.className = `hon-rating-overlay ${isWinner ? "hon-rating-winner" : "hon-rating-loser"}`;
+
     const ratingDisplay = document.createElement("div");
     ratingDisplay.className = "hon-rating-display";
     ratingDisplay.textContent = oldRating;
-    
+
     const changeDisplay = document.createElement("div");
     changeDisplay.className = "hon-rating-change";
     changeDisplay.textContent = isWinner ? `+${change}` : `${change}`;
-    
+
     overlay.appendChild(ratingDisplay);
     overlay.appendChild(changeDisplay);
     card.appendChild(overlay);
@@ -4188,12 +5414,12 @@ async function fetchPerformerCount(performerFilter = {}) {
     const step = isWinner ? 1 : -1;
     const totalSteps = Math.abs(change);
     let stepCount = 0;
-    
+
     const interval = setInterval(() => {
       stepCount++;
       currentDisplay += step;
       ratingDisplay.textContent = currentDisplay;
-      
+
       if (stepCount >= totalSteps) {
         clearInterval(interval);
         ratingDisplay.textContent = newRating;
@@ -4235,8 +5461,8 @@ async function fetchPerformerCount(performerFilter = {}) {
         filter: {
           per_page: -1, // Get all
           sort: "rating",
-          direction: "DESC"
-        }
+          direction: "DESC",
+        },
       });
 
       const performers = result.findPerformers.performers || [];
@@ -4247,21 +5473,21 @@ async function fetchPerformerCount(performerFilter = {}) {
       }
 
       // Find the performer's position in the sorted list
-      const index = performers.findIndex(p => p.id === performerId);
+      const index = performers.findIndex((p) => p.id === performerId);
       if (index === -1) {
         return null;
       }
 
       const performer = performers[index];
-      
+
       // Parse match stats from custom_fields
       const stats = parsePerformerEloData(performer);
-      
+
       return {
         rank: index + 1,
         total: total,
         rating: performer.rating100 || 0,
-        stats: stats
+        stats: stats,
       };
     } catch (error) {
       console.error("[HotOrNot] Error fetching performer battle rank:", error);
@@ -4281,12 +5507,12 @@ async function fetchPerformerCount(performerFilter = {}) {
     const badge = document.createElement("div");
     badge.className = "hon-battle-rank-badge";
     badge.id = "hon-battle-rank-badge";
-    
+
     // Determine rank tier for styling
     const percentile = ((total - rank + 1) / total) * 100;
     let tierClass = "";
     let tierEmoji = "";
-    
+
     if (percentile >= 95) {
       tierClass = "hon-rank-legendary";
       tierEmoji = "👑";
@@ -4303,27 +5529,27 @@ async function fetchPerformerCount(performerFilter = {}) {
       tierClass = "hon-rank-default";
       tierEmoji = "🔥";
     }
-    
+
     // Note: Tier-based color classes removed for better readability
     // The tier emoji still indicates ranking percentile
-    
+
     // Build match stats HTML if stats are available and performer has played matches
-    let matchStatsHTML = '';
+    let matchStatsHTML = "";
     let winRate = null;
     const hasMatchStats = stats && stats.total_matches > 0;
-    
+
     if (hasMatchStats) {
       // Calculate win rate once for both display and tooltip
       winRate = ((stats.wins / stats.total_matches) * 100).toFixed(1);
-      
+
       // Format current streak with color indicator
-      let streakDisplay = '';
+      let streakDisplay = "";
       if (stats.current_streak > 0) {
         streakDisplay = `<span class="hon-streak-positive">W${stats.current_streak}</span>`;
       } else if (stats.current_streak < 0) {
         streakDisplay = `<span class="hon-streak-negative">L${Math.abs(stats.current_streak)}</span>`;
       }
-      
+
       matchStatsHTML = `
         <span class="hon-match-stats">
           <span class="hon-stats-record">
@@ -4336,14 +5562,14 @@ async function fetchPerformerCount(performerFilter = {}) {
         </span>
       `;
     }
-    
+
     badge.innerHTML = `
       <span class="hon-rank-emoji">${tierEmoji}</span>
       <span class="hon-rank-text">Battle Rank #${rank}</span>
       <span class="hon-rank-total">of ${total}</span>
       ${matchStatsHTML}
     `;
-    
+
     // Build comprehensive tooltip
     let tooltipText = `Battle Rank #${rank} of ${total} performers (Rating: ${rating}/100)`;
     if (hasMatchStats) {
@@ -4352,7 +5578,7 @@ async function fetchPerformerCount(performerFilter = {}) {
       tooltipText += `\n• Win Rate: ${winRate}%`;
       tooltipText += `\n• Total Matches: ${stats.total_matches}`;
       if (stats.current_streak !== 0) {
-        const streakType = stats.current_streak > 0 ? 'Winning' : 'Losing';
+        const streakType = stats.current_streak > 0 ? "Winning" : "Losing";
         tooltipText += `\n• Current Streak: ${streakType} ${Math.abs(stats.current_streak)}`;
       }
       if (stats.best_streak > 0) {
@@ -4363,7 +5589,7 @@ async function fetchPerformerCount(performerFilter = {}) {
       }
     }
     badge.title = tooltipText;
-    
+
     return badge;
   }
 
@@ -4373,7 +5599,7 @@ async function fetchPerformerCount(performerFilter = {}) {
    */
   async function injectBattleRankBadge() {
     // Skip injection if the user has disabled the battle rank badge in Stash settings
-    if (!await isBattleRankBadgeEnabled()) {
+    if (!(await isBattleRankBadgeEnabled())) {
       return;
     }
     // Use compare-and-set pattern with global flag to prevent concurrent injections
@@ -4385,7 +5611,7 @@ async function fetchPerformerCount(performerFilter = {}) {
     // Set flags immediately after check - atomic in JS single-threaded event loop
     window._honBadgeInjectionInProgress = true;
     badgeInjectionInProgress = true;
-    
+
     try {
       const performerId = getPerformerIdFromUrl();
       if (!performerId) {
@@ -4411,38 +5637,55 @@ async function fetchPerformerCount(performerFilter = {}) {
       }
 
       // Create the badge with stats
-      const badge = createBattleRankBadge(rankInfo.rank, rankInfo.total, rankInfo.rating, rankInfo.stats);
+      const badge = createBattleRankBadge(
+        rankInfo.rank,
+        rankInfo.total,
+        rankInfo.rating,
+        rankInfo.stats,
+      );
 
       // Find the best place to inject the badge
       // Try to find the rating stars container first (next to star rating)
-      const ratingContainer = document.querySelector(".rating-stars") ||
-                             document.querySelector(".rating-number") ||
-                             document.querySelector("[class*='rating']");
-      
+      const ratingContainer =
+        document.querySelector(".rating-stars") ||
+        document.querySelector(".rating-number") ||
+        document.querySelector("[class*='rating']");
+
       if (ratingContainer && ratingContainer.parentElement) {
         // Insert badge next to the rating
         ratingContainer.parentElement.appendChild(badge);
-        console.log(`[HotOrNot] Injected battle rank badge: #${rankInfo.rank} of ${rankInfo.total}`);
+        console.log(
+          `[HotOrNot] Injected battle rank badge: #${rankInfo.rank} of ${rankInfo.total}`,
+        );
         return;
       }
 
       // Alternative: Find performer detail header area
-      const detailHeader = document.querySelector(".performer-head") ||
-                          document.querySelector(".detail-header") ||
-                          document.querySelector(".performer-meta") ||
-                          document.querySelector(".detail-container h2")?.parentElement;
-      
+      const detailHeader =
+        document.querySelector(".performer-head") ||
+        document.querySelector(".detail-header") ||
+        document.querySelector(".performer-meta") ||
+        document.querySelector(".detail-container h2")?.parentElement;
+
       if (detailHeader) {
         detailHeader.appendChild(badge);
-        console.log(`[HotOrNot] Injected battle rank badge into header: #${rankInfo.rank} of ${rankInfo.total}`);
+        console.log(
+          `[HotOrNot] Injected battle rank badge into header: #${rankInfo.rank} of ${rankInfo.total}`,
+        );
         return;
       }
 
       // Last resort: Find performer name and insert after it
-      const performerName = document.querySelector("h2") || document.querySelector("h1");
+      const performerName =
+        document.querySelector("h2") || document.querySelector("h1");
       if (performerName && performerName.parentElement) {
-        performerName.parentElement.insertBefore(badge, performerName.nextSibling);
-        console.log(`[HotOrNot] Injected battle rank badge after name: #${rankInfo.rank} of ${rankInfo.total}`);
+        performerName.parentElement.insertBefore(
+          badge,
+          performerName.nextSibling,
+        );
+        console.log(
+          `[HotOrNot] Injected battle rank badge after name: #${rankInfo.rank} of ${rankInfo.total}`,
+        );
       }
     } finally {
       window._honBadgeInjectionInProgress = false;
@@ -4479,7 +5722,12 @@ async function fetchPerformerCount(performerFilter = {}) {
   function shouldShowButton() {
     const path = window.location.pathname;
     // Show on /performers or /images listing pages
-    if (path === '/performers' || path === '/performers/' || path === '/images' || path === '/images/') {
+    if (
+      path === "/performers" ||
+      path === "/performers/" ||
+      path === "/images" ||
+      path === "/images/"
+    ) {
       return true;
     }
     // Also show on individual performer pages (/performers/{id})
@@ -4494,7 +5742,7 @@ async function fetchPerformerCount(performerFilter = {}) {
    * Tries several common Stash navbar CSS selectors in order of preference.
    * @returns {boolean} True if the button was successfully injected, false if no navbar was found.
    */
-function addNavbarButton() {
+  function addNavbarButton() {
     if (document.getElementById("hon-nav-btn")) return true;
 
     // Try multiple selectors for Stash's navbar container (right-side area)
@@ -4503,7 +5751,7 @@ function addNavbarButton() {
       ".navbar .ms-auto",
       ".navbar-buttons",
       ".top-nav",
-      ".navbar"
+      ".navbar",
     ];
 
     let navbarContainer = null;
@@ -4532,7 +5780,7 @@ function addNavbarButton() {
    * Attempts navbar injection first; falls back to the original fixed floating button
    * when no Stash navbar container can be located.
    */
-function addFloatingButton() {
+  function addFloatingButton() {
     const existingNavBtn = document.getElementById("hon-nav-btn");
     const existingFloatBtn = document.getElementById("hon-floating-btn");
 
@@ -4580,7 +5828,7 @@ function addFloatingButton() {
   async function openRankingModal() {
     // Detect if we're on performers or images page
     const path = window.location.pathname;
-    if (path === '/images' || path === '/images/') {
+    if (path === "/images" || path === "/images/") {
       battleType = "images";
       // For images, always use Swiss mode
       currentMode = "swiss";
@@ -4595,25 +5843,31 @@ function addFloatingButton() {
         currentMode = "gauntlet";
         // No URL filters when on single performer page
         cachedUrlFilter = null;
-        console.log(`[HotOrNot] On single performer page, auto-launching gauntlet with performer ID: ${singlePerformerId}`);
+        console.log(
+          `[HotOrNot] On single performer page, auto-launching gauntlet with performer ID: ${singlePerformerId}`,
+        );
       } else {
         // Always refresh URL filters when modal opens to capture current state
         // This ensures we get the latest filters from the URL, including any changes
         // made since the last location event or page load
         cachedUrlFilter = getUrlPerformerFilter();
-        
+
         // Log cached filter for debugging
         if (cachedUrlFilter && Object.keys(cachedUrlFilter).length > 0) {
-          console.log('[HotOrNot] Using URL filters for performers:', cachedUrlFilter);
+          console.log(
+            "[HotOrNot] Using URL filters for performers:",
+            cachedUrlFilter,
+          );
         } else {
-          console.log('[HotOrNot] No URL filters detected');
+          console.log("[HotOrNot] No URL filters detected");
         }
       }
     }
-    
+
     // Get performer ID again after battleType is set (only check for performers)
-    const singlePerformerId = battleType === "performers" ? getPerformerIdFromUrl() : null;
-    
+    const singlePerformerId =
+      battleType === "performers" ? getPerformerIdFromUrl() : null;
+
     const existingModal = document.getElementById("hon-modal");
     if (existingModal) existingModal.remove();
 
@@ -4634,11 +5888,11 @@ function addFloatingButton() {
       btn.addEventListener("click", () => {
         // Images always stay in Swiss mode
         if (battleType === "images") return;
-        
+
         const newMode = btn.dataset.mode;
         if (newMode !== currentMode) {
           currentMode = newMode;
-          
+
           // Reset gauntlet state when switching modes
           gauntletChampion = null;
           gauntletWins = 0;
@@ -4648,21 +5902,21 @@ function addFloatingButton() {
           gauntletFallingTested = [];
           // Clear undo state on mode change (previous battle is no longer valid)
           previousBattle = null;
-          
+
           // Update button states
           modal.querySelectorAll(".hon-mode-btn").forEach((b) => {
             b.classList.toggle("active", b.dataset.mode === currentMode);
           });
-          
+
           // Re-show actions (skip button) in case it was hidden
           const actionsEl = document.querySelector(".hon-actions");
           if (actionsEl) actionsEl.style.display = "";
-          
+
           // Hide performer/image selection if not in gauntlet mode
           if (currentMode !== "gauntlet") {
             hidePerformerSelection();
           }
-          
+
           // Load new pair in new mode
           loadNewPair();
         }
@@ -4674,13 +5928,20 @@ function addFloatingButton() {
     if (skipBtn) {
       skipBtn.addEventListener("click", async () => {
         // In gauntlet/champion mode with active run (performers only), skip is disabled
-        if (battleType === "performers" && (currentMode === "gauntlet" || currentMode === "champion") && gauntletChampion) {
+        if (
+          battleType === "performers" &&
+          (currentMode === "gauntlet" || currentMode === "champion") &&
+          gauntletChampion
+        ) {
           return;
         }
-        if(disableChoice) return
+        if (disableChoice) return;
         disableChoice = true;
         // Reset state on skip (only for performers)
-        if (battleType === "performers" && (currentMode === "gauntlet" || currentMode === "champion")) {
+        if (
+          battleType === "performers" &&
+          (currentMode === "gauntlet" || currentMode === "champion")
+        ) {
           gauntletChampion = null;
           gauntletWins = 0;
           gauntletDefeated = [];
@@ -4718,6 +5979,7 @@ function addFloatingButton() {
           selectedGenders.splice(idx, 1);
           btn.classList.remove("active");
         }
+        saveSelectedGenders();
         // Reset gauntlet state when gender selection changes
         gauntletChampion = null;
         gauntletWins = 0;
@@ -4742,10 +6004,15 @@ function addFloatingButton() {
     if (singlePerformerId) {
       const performer = await fetchPerformerById(singlePerformerId);
       if (performer) {
-        console.log(`[HotOrNot] Fetched performer for gauntlet:`, performer.name);
+        console.log(
+          `[HotOrNot] Fetched performer for gauntlet:`,
+          performer.name,
+        );
         startGauntletWithPerformer(performer);
       } else {
-        console.error(`[HotOrNot] Could not fetch performer with ID: ${singlePerformerId}. Performer may have been deleted, access restricted, or ID is invalid.`);
+        console.error(
+          `[HotOrNot] Could not fetch performer with ID: ${singlePerformerId}. Performer may have been deleted, access restricted, or ID is invalid.`,
+        );
         // Fall back to normal behavior if performer not found
         loadNewPair();
       }
@@ -4755,9 +6022,13 @@ function addFloatingButton() {
     }
 
     // Close handlers
-    modal.querySelector(".hon-modal-backdrop").addEventListener("click", closeRankingModal);
-    modal.querySelector(".hon-modal-close").addEventListener("click", closeRankingModal);
-    
+    modal
+      .querySelector(".hon-modal-backdrop")
+      .addEventListener("click", closeRankingModal);
+    modal
+      .querySelector(".hon-modal-close")
+      .addEventListener("click", closeRankingModal);
+
     document.addEventListener("keydown", function escHandler(e) {
       if (e.key === "Escape") {
         closeRankingModal();
@@ -4774,24 +6045,38 @@ function addFloatingButton() {
       }
 
       if (e.key === "ArrowLeft" && currentPair.left) {
-        const leftBody = modal.querySelector('.hon-scene-card[data-side="left"] .hon-scene-body');
+        const leftBody = modal.querySelector(
+          '.hon-scene-card[data-side="left"] .hon-scene-body',
+        );
         if (leftBody) leftBody.click();
       }
       if (e.key === "ArrowRight" && currentPair.right) {
-        const rightBody = modal.querySelector('.hon-scene-card[data-side="right"] .hon-scene-body');
+        const rightBody = modal.querySelector(
+          '.hon-scene-card[data-side="right"] .hon-scene-body',
+        );
         if (rightBody) rightBody.click();
       }
       if (e.key === " " || e.code === "Space") {
         const activeElement = document.activeElement;
-        if (activeElement.tagName !== "INPUT" && activeElement.tagName !== "TEXTAREA") {
+        if (
+          activeElement.tagName !== "INPUT" &&
+          activeElement.tagName !== "TEXTAREA"
+        ) {
           e.preventDefault();
           // Don't skip during active gauntlet/champion run (performers only)
-          if (battleType === "performers" && (currentMode === "gauntlet" || currentMode === "champion") && gauntletChampion) {
+          if (
+            battleType === "performers" &&
+            (currentMode === "gauntlet" || currentMode === "champion") &&
+            gauntletChampion
+          ) {
             return;
           }
-          if(disableChoice) return;
+          if (disableChoice) return;
           disableChoice = true;
-          if (battleType === "performers" && (currentMode === "gauntlet" || currentMode === "champion")) {
+          if (
+            battleType === "performers" &&
+            (currentMode === "gauntlet" || currentMode === "champion")
+          ) {
             gauntletChampion = null;
             gauntletWins = 0;
             gauntletDefeated = [];
@@ -4800,7 +6085,11 @@ function addFloatingButton() {
             gauntletFallingTested = [];
           }
           // Apply ELO draw rating changes for skips in Swiss mode
-          if (currentMode === "swiss" && currentPair.left && currentPair.right) {
+          if (
+            currentMode === "swiss" &&
+            currentPair.left &&
+            currentPair.right
+          ) {
             await handleSkip(currentPair.left, currentPair.right);
           }
           loadNewPair();
@@ -4822,9 +6111,9 @@ function addFloatingButton() {
 
   function init() {
     console.log("[HotOrNot] Initialized");
-    
+
     addFloatingButton();
-    
+
     // Inject battle rank badge if on a single performer page
     if (isOnSinglePerformerPage()) {
       // Delay slightly to ensure the page has rendered
@@ -4835,7 +6124,10 @@ function addFloatingButton() {
     const observer = new MutationObserver(() => {
       addFloatingButton();
       // Also try to inject badge when DOM changes on performer pages
-      if (isOnSinglePerformerPage() && !document.getElementById("hon-battle-rank-badge")) {
+      if (
+        isOnSinglePerformerPage() &&
+        !document.getElementById("hon-battle-rank-badge")
+      ) {
         injectBattleRankBadge();
       }
     });
@@ -4844,39 +6136,48 @@ function addFloatingButton() {
       childList: true,
       subtree: true,
     });
-    
+
     // Listen for location changes to update cached filters
     // This ensures filters are always up-to-date when users navigate or change filters
-    if (typeof PluginApi !== 'undefined' && PluginApi.Event && PluginApi.Event.addEventListener) {
+    if (
+      typeof PluginApi !== "undefined" &&
+      PluginApi.Event &&
+      PluginApi.Event.addEventListener
+    ) {
       PluginApi.Event.addEventListener("stash:location", (e) => {
-        console.log("[HotOrNot] Page changed:", e.detail.data.location.pathname);
-        
+        console.log(
+          "[HotOrNot] Page changed:",
+          e.detail.data.location.pathname,
+        );
+
         const path = e.detail.data.location.pathname;
 
         // Invalidate plugin config cache when navigating away from Settings,
         // so the badge respects any changes the user made.
-        if (path !== '/settings') {
+        if (path !== "/settings") {
           pluginConfigCache = null;
         }
 
         // Update cached filter when on performers page
-        if (path === '/performers' || path === '/performers/') {
+        if (path === "/performers" || path === "/performers/") {
           // Parse current filters from URL
           const newFilter = getUrlPerformerFilter();
-          
+
           // Only update cache if modal is not currently open
           // (if modal is open, it should continue using the filters it was opened with)
           const modalOpen = document.getElementById("hon-modal") !== null;
           if (!modalOpen) {
             cachedUrlFilter = newFilter;
             if (newFilter && Object.keys(newFilter).length > 0) {
-              console.log('[HotOrNot] Updated cached filters:', newFilter);
+              console.log("[HotOrNot] Updated cached filters:", newFilter);
             } else {
-              console.log('[HotOrNot] Cleared cached filters (no filters active)');
+              console.log(
+                "[HotOrNot] Cleared cached filters (no filters active)",
+              );
             }
           }
         }
-        
+
         // Inject battle rank badge when navigating to a single performer page
         if (isOnSinglePerformerPage()) {
           // Delay to allow the page to render
@@ -4890,14 +6191,14 @@ function addFloatingButton() {
   // PERFORMER CARD STAR RATING WIDGET
   // (Integrated from rating plugin)
   // ============================================
-  
+
   // Local cache for ratings to ensure UI stays in sync across React re-renders
   // Map<performerId, { rating100: number|null, timestamp: number }>
   const ratingsCache = new Map();
-  
+
   // Cache TTL in milliseconds (5 minutes) - after this, we'll re-fetch from server
   const RATINGS_CACHE_TTL = 5 * 60 * 1000;
-  
+
   /**
    * Get a rating from the local cache
    * @param {string} performerId - Performer ID
@@ -4906,16 +6207,16 @@ function addFloatingButton() {
   function getCachedRatingForWidget(performerId) {
     const cached = ratingsCache.get(performerId);
     if (!cached) return undefined;
-    
+
     // Check if cache entry is still valid
     if (Date.now() - cached.timestamp > RATINGS_CACHE_TTL) {
       ratingsCache.delete(performerId);
       return undefined;
     }
-    
+
     return cached.rating100;
   }
-  
+
   /**
    * Set a rating in the local cache
    * @param {string} performerId - Performer ID
@@ -4924,10 +6225,10 @@ function addFloatingButton() {
   function setCachedRatingForWidget(performerId, rating100) {
     ratingsCache.set(performerId, {
       rating100,
-      timestamp: Date.now()
+      timestamp: Date.now(),
     });
   }
-  
+
   /**
    * Update performer rating via GraphQL (simple version for star widget)
    * @param {string} performerId - The performer's ID
@@ -4949,24 +6250,28 @@ function addFloatingButton() {
 
     const result = await graphqlQuery(mutation, {
       id: performerId,
-      rating: Math.max(0, Math.min(100, Math.round(rating100)))
+      rating: Math.max(0, Math.min(100, Math.round(rating100))),
     });
 
     const updatedRating = result.performerUpdate.rating100;
-    
+
     // Update the local cache so React re-renders use the correct value
     setCachedRatingForWidget(performerId, updatedRating);
-    
-    console.log(`[HotOrNot] Updated performer ${performerId} rating to ${updatedRating}`);
-    
+
+    console.log(
+      `[HotOrNot] Updated performer ${performerId} rating to ${updatedRating}`,
+    );
+
     // Dispatch custom event so all rating widgets for this performer can update
-    document.dispatchEvent(new CustomEvent("performer:rating:updated", {
-      detail: { performerId, rating100: updatedRating }
-    }));
-    
+    document.dispatchEvent(
+      new CustomEvent("performer:rating:updated", {
+        detail: { performerId, rating100: updatedRating },
+      }),
+    );
+
     return result.performerUpdate;
   }
-  
+
   /**
    * Get performer rating by ID
    * Uses local cache for recently updated ratings to ensure UI consistency
@@ -4979,7 +6284,7 @@ function addFloatingButton() {
     if (cachedRating !== undefined) {
       return cachedRating;
     }
-    
+
     const query = `
       query GetPerformerRating($id: ID!) {
         findPerformer(id: $id) {
@@ -4991,13 +6296,13 @@ function addFloatingButton() {
 
     const result = await graphqlQuery(query, { id: performerId });
     const rating = result.findPerformer ? result.findPerformer.rating100 : null;
-    
+
     // Cache the fetched rating
     setCachedRatingForWidget(performerId, rating);
-    
+
     return rating;
   }
-  
+
   /**
    * Get multiple performer ratings in a single request
    * Uses local cache for recently updated ratings to ensure UI consistency
@@ -5011,7 +6316,7 @@ function addFloatingButton() {
 
     const ratings = new Map();
     const uncachedIds = [];
-    
+
     // First, check the cache for each performer
     for (const id of performerIds) {
       const cachedRating = getCachedRatingForWidget(id);
@@ -5021,7 +6326,7 @@ function addFloatingButton() {
         uncachedIds.push(id);
       }
     }
-    
+
     // If all ratings were cached, return immediately
     if (uncachedIds.length === 0) {
       return ratings;
@@ -5029,15 +6334,17 @@ function addFloatingButton() {
 
     // Build a query that fetches only uncached performers
     // GraphQL aliases allow us to query the same field multiple times with different arguments
-    const aliasedQueries = uncachedIds.map((id, index) => 
-      `p${index}: findPerformer(id: "${id}") { id rating100 }`
-    ).join("\n");
+    const aliasedQueries = uncachedIds
+      .map(
+        (id, index) => `p${index}: findPerformer(id: "${id}") { id rating100 }`,
+      )
+      .join("\n");
 
     const query = `query GetMultiplePerformerRatings { ${aliasedQueries} }`;
 
     try {
       const result = await graphqlQuery(query, {});
-      
+
       uncachedIds.forEach((id, index) => {
         const performer = result[`p${index}`];
         const rating = performer ? performer.rating100 : null;
@@ -5045,13 +6352,15 @@ function addFloatingButton() {
         // Cache the fetched rating
         setCachedRatingForWidget(id, rating);
       });
-      
+
       return ratings;
     } catch (err) {
       console.error("[HotOrNot] Error fetching multiple ratings:", err);
       // Log which performers couldn't be fetched
       if (uncachedIds.length > 0) {
-        console.warn(`[HotOrNot] Failed to fetch ratings for performers: ${uncachedIds.join(", ")}`);
+        console.warn(
+          `[HotOrNot] Failed to fetch ratings for performers: ${uncachedIds.join(", ")}`,
+        );
       }
       // Return what we have from cache (may be partial)
       return ratings;
@@ -5069,7 +6378,8 @@ function addFloatingButton() {
     container.className = "hon-star-rating";
     container.dataset.performerId = performerId;
     // Store the current rating in dataset so it can be updated
-    container.dataset.currentRating = currentRating !== null ? currentRating : "";
+    container.dataset.currentRating =
+      currentRating !== null ? currentRating : "";
 
     // Convert rating100 to 10-star scale (0-100 -> 0-10)
     const starValue = currentRating !== null ? currentRating / 10 : 0;
@@ -5097,10 +6407,10 @@ function addFloatingButton() {
       star.addEventListener("click", async (e) => {
         e.preventDefault();
         e.stopPropagation();
-        
+
         const newStarValue = parseInt(star.dataset.value);
         const newRating100 = newStarValue * 10; // Convert back to rating100
-        
+
         try {
           await updatePerformerRatingSimple(performerId, newRating100);
           // Update the stored rating in dataset
@@ -5153,7 +6463,12 @@ function addFloatingButton() {
 
     stars.forEach((star, index) => {
       const value = index + 1;
-      star.classList.remove("hon-star-filled", "hon-star-half", "hon-star-empty", "hon-star-preview");
+      star.classList.remove(
+        "hon-star-filled",
+        "hon-star-half",
+        "hon-star-empty",
+        "hon-star-preview",
+      );
 
       if (value <= fullStars) {
         star.classList.add("hon-star-filled");
@@ -5244,7 +6559,7 @@ function addFloatingButton() {
    */
   function updateNativeRatingDisplayOnCard(card, rating100) {
     if (!card) return;
-    
+
     // Find and update any native Stash rating elements on the card
     // Look for common Stash rating element patterns
     const ratingSelectors = [
@@ -5252,9 +6567,9 @@ function addFloatingButton() {
       ".rating-value",
       ".rating-display",
       "[class*='rating'][class*='number']",
-      "[class*='rating'][class*='value']"
+      "[class*='rating'][class*='value']",
     ];
-    
+
     // Try specific selectors first for better performance
     let ratingElements = [];
     for (const selector of ratingSelectors) {
@@ -5264,19 +6579,21 @@ function addFloatingButton() {
         break;
       }
     }
-    
+
     // Fallback to broader selector if no specific elements found
     if (ratingElements.length === 0) {
       ratingElements = Array.from(card.querySelectorAll("[class*='rating']"));
     }
-    
-    ratingElements.forEach(el => {
+
+    ratingElements.forEach((el) => {
       // Skip our plugin's rating widget
-      if (el.classList.contains("hon-star-rating") || 
-          el.closest(".hon-star-rating")) {
+      if (
+        el.classList.contains("hon-star-rating") ||
+        el.closest(".hon-star-rating")
+      ) {
         return;
       }
-      
+
       // Update the text content if it contains a valid rating number (0-100)
       const text = el.textContent.trim();
       // Match numbers that could be ratings (1-3 digits, standalone or at start/end)
@@ -5303,17 +6620,21 @@ function addFloatingButton() {
     let element = container.parentElement;
     while (element) {
       // Check for common card class names first (fast)
-      if (element.classList.contains("performer-card") ||
-          element.classList.contains("card")) {
+      if (
+        element.classList.contains("performer-card") ||
+        element.classList.contains("card")
+      ) {
         return element;
       }
       // Check for direct link as child (faster than querySelector)
       const children = element.children;
       for (let i = 0; i < children.length; i++) {
         const child = children[i];
-        if (child.tagName === "A" && 
-            child.href && 
-            child.href.includes("/performers/")) {
+        if (
+          child.tagName === "A" &&
+          child.href &&
+          child.href.includes("/performers/")
+        ) {
           return element;
         }
       }
@@ -5352,16 +6673,17 @@ function addFloatingButton() {
       if (rating === undefined) {
         rating = await getPerformerRatingForWidget(performerId);
       }
-      
+
       // Create and inject the widget
       const ratingWidget = createStarRatingWidget(rating, performerId);
-      
+
       // Find the best place to inject (after the image, before other content)
-      const cardContent = card.querySelector(".performer-card-content") || 
-                         card.querySelector(".card-section") ||
-                         card.querySelector(".card-body") ||
-                         card;
-      
+      const cardContent =
+        card.querySelector(".performer-card-content") ||
+        card.querySelector(".card-section") ||
+        card.querySelector(".card-body") ||
+        card;
+
       // Try to insert at the beginning of the card content
       if (cardContent.firstChild) {
         cardContent.insertBefore(ratingWidget, cardContent.firstChild);
@@ -5385,7 +6707,7 @@ function addFloatingButton() {
       ".performer-card",
       "[class*='PerformerCard']",
       ".card.performer",
-      ".grid-item.performer"
+      ".grid-item.performer",
     ];
 
     let cards = [];
@@ -5400,14 +6722,16 @@ function addFloatingButton() {
     // Alternative: look for cards that have performer links
     if (cards.length === 0) {
       const allCards = document.querySelectorAll(".card");
-      cards = Array.from(allCards).filter(card => {
+      cards = Array.from(allCards).filter((card) => {
         const link = card.querySelector("a[href*='/performers/']");
         return link !== null;
       });
     }
 
     // Filter to only unprocessed cards
-    const unprocessedCards = cards.filter(card => !card.dataset.honRatingProcessed);
+    const unprocessedCards = cards.filter(
+      (card) => !card.dataset.honRatingProcessed,
+    );
     if (unprocessedCards.length === 0) {
       return;
     }
@@ -5429,17 +6753,21 @@ function addFloatingButton() {
     try {
       // Fetch all ratings in a single batch query
       const ratings = await getMultiplePerformerRatingsForWidget(performerIds);
-      
+
       // Inject widgets for each card in parallel
-      const widgetPromises = Array.from(cardIdMap.entries()).map(([performerId, card]) => {
-        const rating = ratings.get(performerId);
-        return injectStarRatingWidget(card, rating);
-      });
+      const widgetPromises = Array.from(cardIdMap.entries()).map(
+        ([performerId, card]) => {
+          const rating = ratings.get(performerId);
+          return injectStarRatingWidget(card, rating);
+        },
+      );
       await Promise.all(widgetPromises);
     } catch (err) {
       console.error("[HotOrNot] Error processing cards in batch:", err);
       // Fallback to individual processing (also parallelized)
-      await Promise.all(unprocessedCards.map(card => injectStarRatingWidget(card)));
+      await Promise.all(
+        unprocessedCards.map((card) => injectStarRatingWidget(card)),
+      );
     }
   }
 
@@ -5449,7 +6777,11 @@ function addFloatingButton() {
    */
   function isPerformersListPage() {
     const path = window.location.pathname;
-    return path === "/performers" || path === "/performers/" || path.startsWith("/performers?");
+    return (
+      path === "/performers" ||
+      path === "/performers/" ||
+      path.startsWith("/performers?")
+    );
   }
 
   // Debounce timeout for star rating processing
@@ -5470,7 +6802,9 @@ function addFloatingButton() {
     document.addEventListener("performer:rating:updated", (e) => {
       const { performerId, rating100 } = e.detail;
       // Find all rating widgets for this performer
-      const widgets = document.querySelectorAll(`.hon-star-rating[data-performer-id="${performerId}"]`);
+      const widgets = document.querySelectorAll(
+        `.hon-star-rating[data-performer-id="${performerId}"]`,
+      );
       widgets.forEach((container) => {
         container.dataset.currentRating = rating100 !== null ? rating100 : "";
         updateStarWidgetDisplay(container, rating100);
@@ -5507,7 +6841,11 @@ function addFloatingButton() {
     });
 
     // Listen for Stash navigation events if PluginApi is available
-    if (typeof PluginApi !== "undefined" && PluginApi.Event && PluginApi.Event.addEventListener) {
+    if (
+      typeof PluginApi !== "undefined" &&
+      PluginApi.Event &&
+      PluginApi.Event.addEventListener
+    ) {
       PluginApi.Event.addEventListener("stash:location", () => {
         if (isPerformersListPage()) {
           // Delay to allow UI to render
