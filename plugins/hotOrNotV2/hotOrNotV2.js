@@ -303,10 +303,12 @@
     // Show refresh button only if more images exist beyond what's selected
     const totalImages = (pool.lTotal || 0) + (pool.pTotal || 0);
     const hasMore = totalImages > selected.length;
+    const lonePortrait = !useLandscape && selected.length === 1;
     // Use single/fit mode for landscape OR when only 1 image was selected
     return {
       thumbnails: selected,
       single: useLandscape || selected.length === 1,
+      lonePortrait,
       hasMore,
     };
   }
@@ -318,8 +320,9 @@
    * @returns {string}
    */
   function buildGalleryExtrasHtml(extraData, performerId) {
-    const { thumbnails, single, hasMore } = extraData;
+    const { thumbnails, single, lonePortrait, hasMore } = extraData;
     const singleClass = single ? " hon-gallery-single" : "";
+    const lonePortraitClass = lonePortrait ? " hon-gallery-lone-portrait" : "";
     const imgs = thumbnails
       .map(
         (src) =>
@@ -330,7 +333,7 @@
       ? `<button class="hon-gallery-refresh-btn" title="Refresh images">&#x21BA;</button>`
       : "";
     return `
-      <div class="hon-image-gallery-extras${singleClass}" data-performer-id="${performerId}">
+      <div class="hon-image-gallery-extras${singleClass}${lonePortraitClass}" data-performer-id="${performerId}">
         ${imgs}
         ${refreshBtn}
       </div>`;
@@ -353,9 +356,10 @@
         btn.textContent = "\u231B";
 
         const extraData = await fetchPerformerExtraImages(performerId);
-        const { thumbnails, single, hasMore } = extraData;
+        const { thumbnails, single, lonePortrait, hasMore } = extraData;
 
         extrasEl.classList.toggle("hon-gallery-single", single);
+        extrasEl.classList.toggle("hon-gallery-lone-portrait", lonePortrait);
 
         extrasEl
           .querySelectorAll(".hon-gallery-extra-img")
