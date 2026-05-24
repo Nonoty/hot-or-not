@@ -1892,8 +1892,8 @@
   background: #111;
 }
 
-/* Single image (landscape or lone portrait): use contain so nothing is cropped */
-.hon-image-gallery-extras.hon-gallery-single .hon-gallery-extra-img {
+/* Lone portrait only: use contain so nothing is cropped */
+.hon-image-gallery-extras.hon-gallery-lone-portrait .hon-gallery-extra-img {
   object-fit: contain;
 }
 
